@@ -1,0 +1,22 @@
+# Mac mini M2 orchestrator environment (see README section 4.3)
+name: chem_m2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - rdkit
+  - openbabel
+  - openmm
+  - pdbfixer
+  - biopython
+  - pandas
+  - numpy
+  - scipy
+  - tqdm
+  - requests
+  - paramiko
+  - pip
+  - pip:
+      - meeko
+      - pubchempy
+      - chembl_webresource_client

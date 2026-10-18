@@ -1,0 +1,7 @@
+rdkit
+pandas
+paramiko
+pytest
+ruff
+bandit
+pip-audit
