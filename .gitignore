@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+# Large/generated pipeline data lives on the NFS share, not in git
+*.sdf
+*.pdb
+*.cif
+*.ckpt
+*.pt
+results/
