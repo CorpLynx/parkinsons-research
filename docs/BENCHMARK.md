@@ -4,7 +4,10 @@ Question answered: *does the docking/scoring stage rank known LRRK2 / GBA1 activ
 If not, new "hits" from the pipeline are not meaningful.
 
 ```bash
-# 1. Build actives (from data/chembl_lrrk2_gba1_library.csv) + decoys. Best: DUD-E / ZINC decoys.
+# 0. Convert downloaded decoys (see "Getting decoys" below) to CSV, dropping anything that matches a known active
+python scripts/convert_decoys.py decoys_final.ism --output decoys.csv --library data/chembl_lrrk2_gba1_library.csv
+
+# 1. Build actives (from data/chembl_lrrk2_gba1_library.csv) + decoys
 python scripts/benchmark.py prepare --target LRRK2 --decoy-pool decoys.csv --decoy-ratio 20
 
 # 1b. No docking needed: do the decoys mimic the actives? (AUC of plain properties should be ~0.5)
@@ -22,6 +25,18 @@ python scripts/benchmark.py evaluate --target LRRK2
   `Baseline:` rows (molecular weight, heavy atoms, logP), which use no docking at all.
 - EF1/5/10% = how many times more actives than chance appear in the top 1/5/10% of the ranking.
 - A good result is necessary, not sufficient. It does not show any new compound works.
+
+## Getting decoys
+Correction to my earlier suggestion: as far as I know **DUD-E has no LRRK2 target** (it does list
+glucocerebrosidase, `glcm`, for GBA1). I could not reach these sites from the build environment, so please check
+each one yourself. Options for LRRK2, best first:
+1. **DUDE-Z** (dudez.docking.org): upload your own active SMILES (e.g. the `act_` rows of `labels.csv`) and it
+   generates property-matched, topologically dissimilar ZINC decoys for them. This fits any target.
+2. **A large ZINC subset** of drug-like molecules as `--decoy-pool`; `prepare` does the property matching and
+   dissimilarity filtering itself.
+3. For GBA1, the DUD-E `glcm` decoys (`decoys_final.ism`) can go straight into `convert_decoys.py`.
+
+Whichever you use, run `check` afterwards.
 
 ## Decoy pools (checked offline)
 `--decoy-pool rdkit-nci` uses the 5,000 NCI structures bundled with RDKit so you can try the workflow with no

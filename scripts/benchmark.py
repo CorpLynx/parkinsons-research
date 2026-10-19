@@ -17,7 +17,7 @@ If the pipeline cannot separate known actives from decoys, new "hits" from it ar
 meaningful. See the generated report.md for a plain-language verdict and its caveats.
 
 Decoys: pass --decoy-pool with a CSV of drug-like molecules (column `smiles`), e.g.
-DUD-E decoys (dude.docking.org) or a ZINC subset. Without one, the other target's
+DUD-E / DUDE-Z / ZINC decoys (convert them with convert_decoys.py). Without one, the other target's
 actives are used as a WEAK cross-target control and the report says so.
 """
 import argparse

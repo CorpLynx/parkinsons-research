@@ -282,3 +282,20 @@ def test_embed_survives_bad_molecule(tmp_path):
     failed = bm.embed_to_sdf([{"id": "ok", "smiles": "CCO"}, {"id": "odd", "smiles": "[H][H]"}],
                              str(tmp_path / "o.sdf"), 0)
     assert "ok" not in failed
+
+
+def test_convert_decoys(tmp_path):
+    import gzip
+
+    import convert_decoys as cd
+    src = tmp_path / "decoys_final.ism.gz"
+    with gzip.open(src, "wt") as fh:
+        fh.write("CCOC(=O)C1CCNCC1 ZINC1\nnot_a_smiles ZINC2\nOCC ZINC3\nOCC ZINC4\n"
+                 "CCCCc1ccccc1N ZINC5\nCCN.Cl ZINC6\n")
+    lib = tmp_path / "lib.csv"
+    pd.DataFrame({"smiles": ["CCCCc1ccccc1N"]}).to_csv(lib, index=False)
+    n, stats = cd.convert(str(src), str(tmp_path / "out.csv"), str(lib))
+    out = pd.read_csv(tmp_path / "out.csv")
+    assert n == 3 and list(out.columns) == ["smiles", "id"]
+    assert stats == {"invalid": 1, "duplicate": 1, "matches_active": 1}
+    assert "CCN" in out["smiles"].tolist()  # largest fragment kept
