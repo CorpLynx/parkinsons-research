@@ -265,3 +265,20 @@ def test_outdir_must_be_under_shared_root(monkeypatch, tmp_path):
     monkeypatch.setattr(bm, "SHARED_ROOT", str(tmp_path))
     with pytest.raises(SystemExit):
         bm.check_under_root("/etc")
+
+
+def test_bundled_nci_pool_and_decoy_quality(tmp_path):
+    pool = bm.bundled_nci_pool()
+    assert len(pool) > 1000
+    from rdkit import Chem as C
+    chosen, _ = bm.select_decoys([C.MolFromSmiles(s) for s in ACT], pool, ratio=3, seed=0)
+    assert len(chosen) == 15
+    df = pd.DataFrame({"smiles": ACT + chosen, "label": [1] * len(ACT) + [0] * len(chosen)})
+    res = bm.decoy_quality(df, n_boot=20)
+    assert "Baseline: logP" in res and all(0 <= r["roc_auc"] <= 1 for r in res.values())
+
+
+def test_embed_survives_bad_molecule(tmp_path):
+    failed = bm.embed_to_sdf([{"id": "ok", "smiles": "CCO"}, {"id": "odd", "smiles": "[H][H]"}],
+                             str(tmp_path / "o.sdf"), 0)
+    assert "ok" not in failed

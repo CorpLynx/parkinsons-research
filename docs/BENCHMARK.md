@@ -7,6 +7,9 @@ If not, new "hits" from the pipeline are not meaningful.
 # 1. Build actives (from data/chembl_lrrk2_gba1_library.csv) + decoys. Best: DUD-E / ZINC decoys.
 python scripts/benchmark.py prepare --target LRRK2 --decoy-pool decoys.csv --decoy-ratio 20
 
+# 1b. No docking needed: do the decoys mimic the actives? (AUC of plain properties should be ~0.5)
+python scripts/benchmark.py check --target LRRK2
+
 # 2. Dock them on arch-2080 with the same P2Rank pocket + GNINA settings as the pipeline
 python scripts/benchmark.py run --target LRRK2 --pdb 7LHT_clean.pdb      # add --pocket-index N to override
 
@@ -19,6 +22,18 @@ python scripts/benchmark.py evaluate --target LRRK2
   `Baseline:` rows (molecular weight, heavy atoms, logP), which use no docking at all.
 - EF1/5/10% = how many times more actives than chance appear in the top 1/5/10% of the ranking.
 - A good result is necessary, not sufficient. It does not show any new compound works.
+
+## Decoy pools (checked offline)
+`--decoy-pool rdkit-nci` uses the 5,000 NCI structures bundled with RDKit so you can try the workflow with no
+download. Offline testing showed it is **too small and not kinase-like**: for LRRK2 the decoys already mismatch on
+H-bond donors at 3 decoys per active (property AUC ~0.68) and get worse at 10:1 (molecular weight AUC 0.66, heavy
+atoms 0.71). For GBA1 (smaller, more polar actives) it matches acceptably. Use `check` to decide; for real
+results use DUD-E or a large ZINC subset. NCI compounds are also not verified inactives.
+
+## Tool details verified against upstream docs
+DiffDock `--config default_inference_args.yaml` and its CSV columns, GNINA flags (`--score_only`, `--seed`,
+`--num_modes`, `--cnn_scoring`, `--center_*`) and ADMET-AI's `admet_predict` CLI and `BBB_Martins` / `hERG` /
+`DILI` output columns match the code. P2Rank has moved to 2.5.1 (Java 17-24); the pinned 2.4.2 still works.
 
 ## Known limits of the current data
 - **Decoys:** without `--decoy-pool` the script falls back to the other target's actives, a weak

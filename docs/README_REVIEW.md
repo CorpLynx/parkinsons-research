@@ -2,7 +2,7 @@
 
 Status: implemented, except items marked **open**.
 
-Implemented: A1–A9, A11 (DiffDock `--config`; verify against your pinned commit), B (config via env, known_hosts, scripts in repo, image/commit pinning guidance), C, most of D. **Open:** A10 (PDB IDs/G2019S could not be checked — RCSB was unreachable from the build environment), per-node env files for DiffDock/ADMET/REINVENT4, LICENSE and citations (owner's choice), Ollama/OpenMM role clarification. The DiffDock rescoring and GNINA/Docker commands are unit-tested only for quoting; they have **not** been run on GPU hardware.
+Implemented: A1–A9, A11 (DiffDock `--config` verified against upstream README), B (config via env, known_hosts, scripts in repo, image/commit pinning guidance), C, most of D. **Open:** A10 (PDB IDs/G2019S could not be checked — RCSB was unreachable from the build environment), per-node env files for DiffDock/ADMET/REINVENT4, LICENSE and citations (owner's choice), Ollama/OpenMM role clarification. The DiffDock rescoring and GNINA/Docker commands are unit-tested only for quoting; they have **not** been run on GPU hardware.
 
 ## A. Correctness issues in the pipeline (highest priority)
 

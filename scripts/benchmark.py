@@ -4,6 +4,7 @@ benchmark.py - Does the docking/scoring stage rank known actives above decoys?
 
 Retrospective virtual-screening benchmark for the LRRK2 / GBA1 pipeline:
 
+  check     Verify the decoys mimic the actives (before spending GPU time).
   prepare   Build a labelled set: known actives (ChEMBL library) + property-matched,
             structurally dissimilar decoys, written as a 3D SDF plus labels.csv.
             (Mac mini, needs RDKit only)
@@ -29,7 +30,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-from rdkit import Chem, DataStructs, RDLogger
+from rdkit import Chem, DataStructs, RDConfig, RDLogger
 from rdkit.Chem import AllChem, Descriptors, rdFingerprintGenerator, rdMolDescriptors
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
@@ -66,10 +67,13 @@ def property_vector(mol):
         rdMolDescriptors.CalcNumHBA(mol),
         rdMolDescriptors.CalcNumRotatableBonds(mol),
         Chem.GetFormalCharge(mol),
+        rdMolDescriptors.CalcTPSA(mol),
+        rdMolDescriptors.CalcNumAromaticRings(mol),
     ], dtype=float)
 
 
-PROP_SCALE = np.array([25.0, 0.7, 1.0, 1.0, 1.0, 1.0])  # roughly one "bin" per property
+# roughly one "bin" per property: MW, logP, HBD, HBA, rotB, charge, TPSA, aromatic rings
+PROP_SCALE = np.array([25.0, 0.5, 0.7, 1.0, 1.5, 0.7, 12.0, 0.8])
 
 
 def select_decoys(active_mols, pool_smiles, ratio, seed=0, max_tanimoto=MAX_DECOY_TANIMOTO):
@@ -178,6 +182,53 @@ def verdict(auc, ci_low, baseline_best_auc):
     return "Good signal (still validate on an independent target/set before relying on it)."
 
 
+def bundled_nci_pool():
+    """Convenience decoy pool shipped with RDKit (NCI first 5k structures; offline, no download).
+    Not verified-inactive: prefer DUD-E / ZINC decoys for any result you intend to rely on."""
+    path = os.path.join(RDConfig.RDDataDir, "NCI", "first_5K.smi")
+    with open(path) as fh:
+        return [line.split()[0] for line in fh if line.strip()]
+
+
+def baseline_table(df):
+    """Structure-only baselines (no docking) for a labelled frame with `smiles` and `label`."""
+    mols = [Chem.MolFromSmiles(s) for s in df["smiles"]]
+    out = df.copy()
+    out["Baseline: molecular weight"] = [Descriptors.MolWt(m) for m in mols]
+    out["Baseline: heavy atoms"] = [m.GetNumHeavyAtoms() for m in mols]
+    out["Baseline: logP"] = [Descriptors.MolLogP(m) for m in mols]
+    out["Baseline: H-bond donors"] = [rdMolDescriptors.CalcNumHBD(m) for m in mols]
+    out["Baseline: TPSA"] = [rdMolDescriptors.CalcTPSA(m) for m in mols]
+    return out, [c for c in out.columns if c.startswith("Baseline")]
+
+
+def decoy_quality(df, n_boot=200, seed=0):
+    """AUC of each trivial property for actives vs decoys. Values far from 0.5 mean the decoys
+    do not mimic the actives and a docking score could win just by tracking that property."""
+    df, cols = baseline_table(df)
+    y = df["label"].to_numpy()
+    return {c: {"roc_auc": roc_auc(y, df[c].to_numpy()),
+                "roc_auc_ci95": bootstrap_ci(y, df[c].to_numpy(), roc_auc, n_boot, seed)} for c in cols}
+
+
+def cmd_check(args):
+    """Decoy sanity check that needs no docking: how well do decoys match the actives?"""
+    outdir = check_under_root(args.outdir or default_outdir(args.target))
+    df = pd.read_csv(os.path.join(outdir, "labels.csv"))
+    res = decoy_quality(df, args.bootstrap, args.seed)
+    print(f"Decoy quality for {args.target} ({int(df['label'].sum())} actives, "
+          f"{int((df['label'] == 0).sum())} decoys). AUC near 0.5 = well matched.")
+    worst = 0.0
+    for name, r in res.items():
+        dev = abs(r["roc_auc"] - 0.5)
+        worst = max(worst, dev)
+        flag = "  <-- poorly matched" if dev > 0.15 else ""
+        print(f"  {name:<28} AUC {r['roc_auc']:.3f}{flag}")
+    print("OK: properties look matched." if worst <= 0.15 else
+          "WARNING: some properties differ strongly; a docking score may win by tracking them.")
+    return res
+
+
 # ----------------------------------------------------------------------------- stages
 def default_outdir(target):
     return os.path.join(SHARED_ROOT, "07_benchmark", target)
@@ -217,7 +268,11 @@ def embed_to_sdf(records, sdf_path, seed):
     params.randomSeed = seed
     for rec in records:
         mol = Chem.AddHs(Chem.MolFromSmiles(rec["smiles"]))
-        if AllChem.EmbedMolecule(mol, params) != 0:
+        try:
+            embedded = AllChem.EmbedMolecule(mol, params) == 0
+        except RuntimeError:  # some exotic molecules violate distance-geometry bounds
+            embedded = False
+        if not embedded:
             failed.append(rec["id"])
             continue
         with contextlib.suppress(Exception):  # optimisation is best-effort
@@ -237,7 +292,12 @@ def cmd_prepare(args):
         sys.exit(f"Only {len(actives)} actives for {args.target} after filtering; need >= 5.")
 
     warnings = []
-    if args.decoy_pool:
+    if args.decoy_pool == "rdkit-nci":
+        pool_smiles = bundled_nci_pool()
+        warnings.append("Decoys come from RDKit's bundled NCI set (convenience pool, not verified "
+                        "inactives). Use DUD-E / ZINC decoys for results you intend to rely on.")
+        print("WARNING:", warnings[-1])
+    elif args.decoy_pool:
         pool_df = pd.read_csv(args.decoy_pool, nrows=MAX_POOL_ROWS)
         if "smiles" not in pool_df:
             sys.exit("--decoy-pool needs a `smiles` column")
@@ -335,11 +395,7 @@ def cmd_evaluate(args):
     manifest = json.load(open(os.path.join(outdir, "manifest.json")))
 
     # Trivial baselines computed from structure only (no docking).
-    mols = [Chem.MolFromSmiles(s) for s in df["smiles"]]
-    df["Baseline: molecular weight"] = [Descriptors.MolWt(m) for m in mols]
-    df["Baseline: heavy atoms"] = [m.GetNumHeavyAtoms() for m in mols]
-    df["Baseline: logP"] = [Descriptors.MolLogP(m) for m in mols]
-    baseline_cols = [c for c in df.columns if c.startswith("Baseline")]
+    df, baseline_cols = baseline_table(df)
 
     y = df["label"].to_numpy()
     results, n_undocked = {}, {}
@@ -415,7 +471,9 @@ def main():
     p = sub.add_parser("prepare", help="build actives + decoys")
     common(p)
     p.add_argument("--library", default=DEFAULT_LIBRARY)
-    p.add_argument("--decoy-pool", help="CSV with a `smiles` column (e.g. DUD-E / ZINC decoys)")
+    p.add_argument("--decoy-pool",
+                   help="CSV with a `smiles` column (e.g. DUD-E / ZINC decoys), or `rdkit-nci` for the "
+                        "small convenience pool bundled with RDKit")
     p.add_argument("--decoy-ratio", type=int, default=20, help="decoys per active (default 20)")
     p.add_argument("--min-pchembl", type=float, default=6.0, help="activity cutoff (6.0 = 1 uM)")
     p.add_argument("--mode", default="any", choices=["any", "inhibitor_or_binder", "activator_or_chaperone"])
@@ -427,6 +485,11 @@ def main():
     p.add_argument("--pdb", required=True, type=validate_pdb_filename, help="e.g. 7LHT_clean.pdb")
     p.add_argument("--pocket-index", type=int, default=None)
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("check", help="decoy-quality check (no docking needed)")
+    common(p)
+    p.add_argument("--bootstrap", type=int, default=200)
+    p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("evaluate", help="compute metrics and write report.md")
     common(p)
