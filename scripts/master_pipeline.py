@@ -79,7 +79,7 @@ def run_remote_ssh(node_key, command, stage_label):
     print(f"[{stage_label}] Completed successfully.")
 
 
-def get_top_pocket_coords(target_name, pdb_filename):
+def get_top_pocket_coords(target_name, pdb_filename, pocket_index=None):
     """Runs P2Rank on arch_4070 and extracts the predicted pocket center (X, Y, Z)."""
     pdb_path = f"{SHARED_ROOT}/00_targets/{target_name}/{pdb_filename}"
     out_dir = f"{SHARED_ROOT}/03_pockets/{target_name}"
@@ -90,8 +90,12 @@ def get_top_pocket_coords(target_name, pdb_filename):
     df = pd.read_csv(predictions_csv, skipinitialspace=True)
     if df.empty:
         raise RuntimeError(f"P2Rank found no pockets for {pdb_filename}")
-    # Select Rank 1 catalytic pocket for LRRK2, or Rank 2 allosteric chaperone pocket for GBA1
-    pocket_idx = 0 if target_name.upper() == "LRRK2" else (1 if len(df) > 1 else 0)
+    # Default: rank 1 pocket for LRRK2, rank 2 for GBA1. The GBA1 choice is an unverified
+    # assumption -- override with --pocket-index after inspecting P2Rank output / the structure.
+    if pocket_index is None:
+        pocket_idx = 0 if target_name.upper() == "LRRK2" else (1 if len(df) > 1 else 0)
+    else:
+        pocket_idx = min(max(pocket_index, 0), len(df) - 1)
     row = df.iloc[pocket_idx]
     cx, cy, cz = float(row["center_x"]), float(row["center_y"]), float(row["center_z"])
     print(f"[Pocket Coords] Selected Pocket #{pocket_idx+1} for {target_name}: X={cx:.2f}, Y={cy:.2f}, Z={cz:.2f}")
@@ -160,14 +164,15 @@ def extract_top_hits(poses, filtered_csv, top_hits_csv, min_cnn_score=MIN_CNN_SC
     return len(df)
 
 
-def gnina_docker_cmd(gpu_id, args):
+def gnina_docker_cmd(gpu_id, args, out_dir=None):
     """Hardened GNINA container invocation: no extra privileges, non-root, read-only inputs."""
+    out_dir = out_dir or SHARED_ROOT + "/05_gnina_rescored"
     return (
         f"docker run --rm --gpus {q(chr(34) + 'device=' + gpu_id + chr(34))} "
         f"--cap-drop ALL --security-opt no-new-privileges "
         f"--user \"$(id -u):$(id -g)\" "
         f"-v {q(SHARED_ROOT)}:{q(SHARED_ROOT)}:ro "
-        f"-v {q(SHARED_ROOT + '/05_gnina_rescored')}:{q(SHARED_ROOT + '/05_gnina_rescored')} "
+        f"-v {q(out_dir)}:{q(out_dir)} "
         f"{q(GNINA_IMAGE)} gnina {args}"
     )
 
@@ -189,6 +194,8 @@ def main():
                         help="Cleaned PDB filename (e.g., 7LHT_clean.pdb or 6N3F_clean.pdb)")
     parser.add_argument("--raw_smiles", default=f"{SHARED_ROOT}/01_ligands_raw/cns_starter.csv",
                         help="Path to raw SMILES CSV")
+    parser.add_argument("--pocket-index", type=int, default=None,
+                        help="0-based P2Rank pocket to dock into (default: 0 for LRRK2, 1 for GBA1)")
     args = parser.parse_args()
 
     raw_smiles = os.path.realpath(args.raw_smiles)
@@ -209,7 +216,7 @@ def main():
 
     # Stage 2: Locate Binding Pocket via P2Rank on arch_4070
     print("\n=== STAGE 2: Binding Pocket Identification (Arch 4070 Ti Super) ===")
-    cx, cy, cz, pdb_path = get_top_pocket_coords(args.target, args.pdb)
+    cx, cy, cz, pdb_path = get_top_pocket_coords(args.target, args.pdb, args.pocket_index)
 
     diffdock_csv = f"{SHARED_ROOT}/scripts/{args.target}_diffdock_input.csv"
     build_diffdock_csv(pdb_path, cns_csv, diffdock_csv)

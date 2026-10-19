@@ -161,3 +161,107 @@ def test_chembl_library_schema_and_bbb_consistency():
     assert ml2, "reference MLi-2 (CHEMBL4098877) absent from library"
     assert ml2[0]["passes_bbb"] == "True", "MLi-2 must pass BBB filter"
     print(f"[check] library {len(rows)} compounds, {n_bbb} BBB-passing, MLi-2 present+BBB-pass")
+
+
+# ---------------------------------------------------------------- library cleaning / benchmark
+import json  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+import benchmark as bm  # noqa: E402
+import build_chembl_library as bcl  # noqa: E402
+
+
+def test_non_human_assays_detected():
+    assert bcl.is_non_human_assay("Inhibitory activity against Agrobacterium sp. Beta-glucosidase")
+    assert bcl.is_non_human_assay("sweet almond beta-glucosidase")
+    assert not bcl.is_non_human_assay("Inhibition of recombinant human GBA1")
+
+
+def test_shipped_library_is_clean():
+    lib = pd.read_csv(bm.DEFAULT_LIBRARY)
+    assert not lib["assay_description"].map(bcl.is_non_human_assay).any()
+    assert {"mode_hint", "source_class"} <= set(lib.columns)
+    assert not (lib["pref_name"] == lib["chembl_id"]).any()
+
+
+def test_metrics_perfect_and_random():
+    y = np.array([1] * 10 + [0] * 90)
+    assert bm.roc_auc(y, np.r_[np.ones(10), np.zeros(90)]) == 1.0
+    assert bm.enrichment_factor(y, np.r_[np.ones(10), np.zeros(90)], 0.10) == pytest.approx(10.0)
+    rng = np.random.default_rng(1)
+    assert abs(bm.roc_auc(y, rng.random(100)) - 0.5) < 0.2
+    # ties are scored pessimistically for AP
+    assert bm.average_precision(y, np.zeros(100)) < 0.2
+
+
+def test_verdict_requires_ci_above_random():
+    assert "No detectable" in bm.verdict(0.75, 0.48, 0.5)
+    assert "trivial property baseline" in bm.verdict(0.75, 0.6, 0.74)
+    assert "Moderate" in bm.verdict(0.75, 0.6, 0.5)
+
+
+ACT = ["CCCCc1ccccc1N", "CCCCc1ccccc1C", "CCCCCc1ccccc1O", "CCCCc1ccc(F)cc1", "CCCCCc1ccccc1N"]
+POOL = ["CCOC(=O)C1CCNCC1C", "CC(C)NC(=O)c1ccncc1", "OC1CCCCC1CC(=O)N", "CNC(=O)C1CCCN1C", "CCN(CC)C(=O)c1ccccn1",
+        "CC1CCN(C(=O)C2CC2)CC1", "NC(=O)C1CCCCC1C", "COC(=O)c1ccncc1C"]
+
+
+def test_decoys_dissimilar_and_unique():
+    from rdkit import Chem as C
+    active_mols = [C.MolFromSmiles(s) for s in ACT]
+    chosen, pool_size = bm.select_decoys(active_mols, POOL, ratio=1, seed=0)
+    assert pool_size > 0 and len(chosen) == len(set(chosen)) and len(chosen) <= len(ACT)
+    assert not set(chosen) & set(bm.standardize(s)[0] for s in ACT)
+
+
+def _write_scored_sdf(path, ids_scores):
+    w = Chem.SDWriter(path)
+    for name, cnn in ids_scores:
+        m = Chem.MolFromSmiles("CC")
+        m.SetProp("_Name", name)
+        m.SetProp("CNNscore", str(cnn))
+        m.SetProp("CNNaffinity", str(cnn * 6))
+        m.SetProp("minimizedAffinity", str(-cnn * 8))
+        w.write(m)
+    w.close()
+
+
+def test_prepare_and_evaluate_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(bm, "SHARED_ROOT", str(tmp_path))
+    lib = pd.DataFrame({
+        "ligand_id": [f"LRRK2_{i}" for i in range(5)] + ["GBA1_x"],
+        "smiles": ACT + ["CCO"], "target": ["LRRK2"] * 5 + ["GBA1"], "pchembl": [8.0] * 6,
+        "mode_hint": ["inhibitor_or_binder"] * 6, "source_class": ["dedicated_assay"] * 6})
+    lib_path = tmp_path / "lib.csv"
+    lib.to_csv(lib_path, index=False)
+    pool_path = tmp_path / "pool.csv"
+    pd.DataFrame({"smiles": POOL}).to_csv(pool_path, index=False)
+    outdir = tmp_path / "bm"
+
+    class A:
+        target, library, decoy_pool = "LRRK2", str(lib_path), str(pool_path)
+        decoy_ratio, min_pchembl, mode, source_class, seed = 1, 6.0, "any", "any", 0
+        outdir_ = None
+    A.outdir = str(outdir)
+    bm.cmd_prepare(A)
+    labels = pd.read_csv(outdir / "labels.csv")
+    assert labels["label"].sum() == 5 and (labels["label"] == 0).sum() >= 2
+    assert json.load(open(outdir / "manifest.json"))["library_sha256"]
+
+    # Perfect fake docking: actives score high, decoys low.
+    _write_scored_sdf(str(outdir / "scored.sdf"),
+                      [(r.id, 0.9 if r.label else 0.1) for r in labels.itertuples()])
+
+    class E:
+        target, bootstrap, seed = "LRRK2", 50, 0
+    E.outdir = str(outdir)
+    bm.cmd_evaluate(E)
+    res = json.load(open(outdir / "results.json"))["results"]
+    assert res["CNNscore"]["roc_auc"] == 1.0
+    assert (outdir / "report.md").read_text().startswith("# Benchmark report")
+
+
+def test_outdir_must_be_under_shared_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(bm, "SHARED_ROOT", str(tmp_path))
+    with pytest.raises(SystemExit):
+        bm.check_under_root("/etc")

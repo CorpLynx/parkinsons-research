@@ -11,12 +11,14 @@ bioactivities against:
   * LRRK2  -> CHEMBL1075104  Leucine-rich repeat serine/threonine-protein
                                     kinase 2  (human Q5S007; public assays
                                     include the G2019S mutant)
-  * GBA1   -> CHEMBL4106172  Glucocerebrosidase GBA1/GBA2 protein family
-                                    (human GBA1 P04062 + GBA2 Q9HCG7)
+  * GBA1   -> CHEMBL2179     Lysosomal acid glucosylceramidase
+                                    (human GBA1, UniProt P04062)
 
 Each compound is curated:
   * valid canonical SMILES
   * human, standard_flag = 1 activity (IC50 / Ki / Kd / EC50 / pIC50)
+  * assays on non-human enzymes (e.g. Agrobacterium / almond beta-glucosidase,
+    which ChEMBL maps onto the human GBA1 target record) are excluded
   * deduplicated by parent ChEMBL ID, keeping the most potent entry
   * BBB / CNS drug-likeness filter using ChEMBL's precomputed molecular
     properties, mirroring cns_filter.passes_bbb_rules exactly (so no RDKit
@@ -28,10 +30,12 @@ Output: a CSV with one row per compound and these columns:
   ligand_id, smiles, chembl_id, pref_name, max_phase,
   target, target_chembl_id, standard_type, standard_value_nm, pchembl,
   assay_description, document_journal, document_year,
-  mw, logp, tpsa, hbd, hba, rot_bonds, heavy_atoms, passes_bbb, is_reference
+  mw, logp, tpsa, hbd, hba, rot_bonds, heavy_atoms, passes_bbb, is_reference,
+  mode_hint, source_class
 
 Usage:
     python scripts/build_chembl_library.py [--output PATH] [--limit N]
+    python scripts/build_chembl_library.py --clean IN.csv --output OUT.csv   # offline re-annotation
 
 The output is meant to live under the shared NFS root's
 01_ligands_raw/ directory and be passed to cns_filter.py / master_pipeline.py
@@ -41,6 +45,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -97,6 +102,30 @@ except ImportError:  # pragma: no cover - rdkit is required in chem_m2
     _RDKIT = False
 
 
+# ChEMBL maps some assays on other species' enzymes onto the human target record.
+NON_HUMAN_ASSAY_RE = re.compile(
+    r"agrobacter|almond|bacteri|yeast|fung|aspergill|bovine|\bcow\b|\bmurine\b|\bmouse\b|"
+    r"\bmice\b|\brat\b|\brabbit\b|porcine|\bpig\b|caulobacter|thermo|sulfolobus|"
+    r"\bplant\b|\bsoybean\b|\bspinach\b",
+    re.IGNORECASE,
+)
+ACTIVATOR_RE = re.compile(r"activat|chaperon|stabili[sz]|enhanc|rescue|translocat", re.IGNORECASE)
+KINOME_PANEL_RE = re.compile(r"navigating the kinome|panel member|kinase panel|kinome", re.IGNORECASE)
+
+
+def is_non_human_assay(description):
+    return bool(description and NON_HUMAN_ASSAY_RE.search(str(description)))
+
+
+def annotate_mode(description, journal=None, year=None):
+    """Heuristic labels: what the assay measures and whether it came from a broad kinome panel."""
+    desc = str(description or "")
+    mode = "activator_or_chaperone" if ACTIVATOR_RE.search(desc) else "inhibitor_or_binder"
+    panel = bool(KINOME_PANEL_RE.search(desc)) or (
+        str(journal or "") == "Nat Biotechnol" and str(year or "").split(".")[0] in ("2008", "2011"))
+    return mode, ("kinome_panel" if panel else "dedicated_assay")
+
+
 def compute_props(smiles):
     """Compute BBB-relevant descriptors from a SMILES string (RDKit).
 
@@ -151,7 +180,7 @@ def _fetch(url):
     last_err = None
     for attempt in range(2):
         try:
-            with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310 - fixed HTTPS ChEMBL host
+            with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310  # nosec B310 - fixed HTTPS ChEMBL host
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
             last_err = exc
@@ -244,6 +273,8 @@ def curate_target(target_name, cfg):
         smiles = a.get("canonical_smiles")
         if not smiles:
             continue
+        if is_non_human_assay(a.get("assay_description")):
+            continue
         pchembl = _num(a.get("pchembl_value"))
         parent = a.get("parent_molecule_chembl_id") or a.get("molecule_chembl_id")
         key = parent
@@ -286,7 +317,7 @@ def curate_target(target_name, cfg):
     for entry in ranked:
         props = compute_props(entry["smiles"])
         entry.update({
-            "pref_name": entry.get("pref_name") or entry["chembl_id"],
+            "pref_name": entry.get("pref_name"),
             "max_phase": None,
             "mw": props["mw"],
             "logp": props["logp"],
@@ -431,7 +462,7 @@ def build_library(output, limit=MAX_COMPOUNDS_PER_TARGET):
         "target", "target_chembl_id", "standard_type", "standard_value_nm",
         "pchembl", "assay_description", "document_journal", "document_year",
         "mw", "logp", "tpsa", "hbd", "hba", "rot_bonds", "heavy_atoms",
-        "passes_bbb", "is_reference",
+        "passes_bbb", "is_reference", "mode_hint", "source_class",
     ]
     with open(output, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
@@ -439,6 +470,8 @@ def build_library(output, limit=MAX_COMPOUNDS_PER_TARGET):
         for r in all_rows:
             # standard_value_nm from stored nm
             r["standard_value_nm"] = r.get("nm")
+            r["mode_hint"], r["source_class"] = annotate_mode(
+                r.get("assay_description"), r.get("document_journal"), r.get("document_year"))
             writer.writerow(r)
 
     n_total = len(all_rows)
@@ -458,6 +491,35 @@ def build_library(output, limit=MAX_COMPOUNDS_PER_TARGET):
     return n_total, n_bbb
 
 
+def clean_library(input_csv, output_csv):
+    """Offline re-annotation of an existing library: drops non-human assays, blanks
+    placeholder names, adds mode_hint/source_class. Needs no network access."""
+    with open(input_csv, newline="") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+        fields = list(reader.fieldnames or [])
+    kept, dropped = [], 0
+    for r in rows:
+        if is_non_human_assay(r.get("assay_description")):
+            dropped += 1
+            continue
+        if r.get("pref_name") == r.get("chembl_id"):
+            r["pref_name"] = ""
+        r["mode_hint"], r["source_class"] = annotate_mode(
+            r.get("assay_description"), r.get("document_journal"), r.get("document_year"))
+        kept.append(r)
+    for extra in ("mode_hint", "source_class"):
+        if extra not in fields:
+            fields.append(extra)
+    os.makedirs(os.path.dirname(os.path.abspath(output_csv)) or ".", exist_ok=True)
+    with open(output_csv, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(kept)
+    print(f"Kept {len(kept)} rows, dropped {dropped} non-human-assay rows -> {output_csv}")
+    return len(kept), dropped
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build a curated ChEMBL library of known LRRK2 and GBA1 compounds."
@@ -473,8 +535,13 @@ def main():
         default=MAX_COMPOUNDS_PER_TARGET,
         help="Max compounds per target after potency filtering.",
     )
+    parser.add_argument("--clean", metavar="IN_CSV",
+                        help="Re-annotate an existing library CSV offline instead of querying ChEMBL.")
     args = parser.parse_args()
-    build_library(args.output, limit=args.limit)
+    if args.clean:
+        clean_library(args.clean, args.output)
+    else:
+        build_library(args.output, limit=args.limit)
 
 
 if __name__ == "__main__":
