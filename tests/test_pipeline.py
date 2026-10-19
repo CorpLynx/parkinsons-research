@@ -104,3 +104,60 @@ def test_drop_long_gaps():
     f = F()
     prep_targets.drop_long_gaps(f)
     assert list(f.missingResidues) == [(0, 5)]
+
+
+def test_chembl_library_schema_and_bbb_consistency():
+    """The curated ChEMBL library must be pipeline-ready:
+    required columns, valid SMILES, and passes_bbb consistent with cns_filter
+    BBB rules computed from SMILES via RDKit (mirrors cns_filter exactly)."""
+    import csv
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parent.parent
+    lib = repo_root / "data" / "chembl_lrrk2_gba1_library.csv"
+    assert lib.is_file(), f"curated library not found: {lib}"
+    rows = list(csv.DictReader(lib.open()))
+    assert rows, "library is empty"
+    required = {"ligand_id", "smiles", "target", "passes_bbb", "is_reference"}
+    assert required <= set(rows[0].keys()), f"missing columns: {required - set(rows[0].keys())}"
+    assert all(r["target"] in {"LRRK2", "GBA1"} for r in rows)
+    assert all(r["smiles"] for r in rows), "every compound needs a SMILES"
+
+    # BBB flag must agree with the same rules cns_filter applies to SMILES.
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Descriptors, rdMolDescriptors
+        have_rdkit = True
+    except ImportError:
+        have_rdkit = False
+
+    for r in rows:
+        assert pd_common.sanitize_id(r["ligand_id"]) == r["ligand_id"], f"unsafe ligand_id: {r['ligand_id']!r}"
+        if have_rdkit:
+            mol = Chem.MolFromSmiles(r["smiles"])
+            assert mol is not None, f"invalid SMILES for {r['ligand_id']}: {r['smiles']!r}"
+            mw = Descriptors.MolWt(mol)
+            logp = Descriptors.MolLogP(mol)
+            tpsa = rdMolDescriptors.CalcTPSA(mol)
+            hbd = rdMolDescriptors.CalcNumHBD(mol)
+            hba = rdMolDescriptors.CalcNumHBA(mol)
+            rtb = rdMolDescriptors.CalcNumRotatableBonds(mol)
+            expected = (
+                mw <= 450.0
+                and 1.0 <= logp <= 4.5
+                and tpsa < 90.0
+                and hbd <= 3
+                and hba <= 7
+                and rtb <= 8
+                and mol.GetNumHeavyAtoms() <= 100
+            )
+            assert (r["passes_bbb"] == "True") == expected, (
+                f"passes_bbb mismatch for {r['ligand_id']}: stored={r['passes_bbb']} computed={expected}"
+            )
+
+    n_bbb = sum(1 for r in rows if r["passes_bbb"] == "True")
+    assert n_bbb > 0, "library should contain BBB-penetrant compounds"
+    # Reference compound MLi-2 must be present and BBB-passing.
+    ml2 = [r for r in rows if r["chembl_id"] == "CHEMBL4098877"]
+    assert ml2, "reference MLi-2 (CHEMBL4098877) absent from library"
+    assert ml2[0]["passes_bbb"] == "True", "MLi-2 must pass BBB filter"
+    print(f"[check] library {len(rows)} compounds, {n_bbb} BBB-passing, MLi-2 present+BBB-pass")
