@@ -161,7 +161,7 @@ def _fetch(url):
     last_err = None
     for attempt in range(2):
         try:
-            with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310 - fixed HTTPS ChEMBL host
+            with urllib.request.urlopen(url, timeout=30) as resp:  # nosec B310 - fixed HTTPS ChEMBL host  # noqa: S310
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
             last_err = exc

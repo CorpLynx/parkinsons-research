@@ -61,8 +61,17 @@ def remote_path(path):
     return shlex.quote(path)
 
 
-def run_remote_ssh(node_key, command, stage_label):
-    """Executes a command on the specified Arch Linux GPU node over SSH (key auth, verified host)."""
+def run_remote_ssh(node_key, command, stage_label, dry_run=False):
+    """Executes a command on the specified Arch Linux GPU node over SSH (key auth, verified host).
+
+    With dry_run=True the command is printed instead of executed, so the full
+    command surface can be verified on the Mac mini before touching the GPU nodes.
+    """
+    if dry_run:
+        cfg = get_nodes()[node_key]
+        print(f"[dry-run:{stage_label}] would run on {node_key} ({cfg['host']}):")
+        print(f"  {command}")
+        return
     cfg = get_nodes()[node_key]
     client = paramiko.SSHClient()
     client.load_system_host_keys()
@@ -139,21 +148,44 @@ def mark_stage_done(manifest, stage_name, detail=None):
     save_manifest(manifest["run_id"], manifest["target"], manifest)
 
 
-def get_top_pocket_coords(run_id, target, pdb_filename):
+def select_pocket(df, target):
+    """Choose which P2Rank pocket to dock into.
+
+    LRRK2 -> rank 1 (the ATP-binding catalytic pocket).
+    GBA1  -> rank 2 (the allosteric site used by chemical chaperones);
+             falls back to rank 1 when fewer than two pockets were predicted.
+
+    Returns (pocket_index, center_x, center_y, center_z).
+    """
+    if df is None or len(df) == 0:
+        raise RuntimeError("P2Rank returned no pockets to select from")
+    target = target.upper()
+    if target == "LRRK2":
+        pocket_idx = 0
+    else:
+        pocket_idx = 1 if len(df) > 1 else 0
+    row = df.iloc[pocket_idx]
+    return (
+        pocket_idx,
+        float(row["center_x"]),
+        float(row["center_y"]),
+        float(row["center_z"]),
+    )
+
+
+def get_top_pocket_coords(run_id, target, pdb_filename, dry_run=False):
     """Runs P2Rank on arch_4070 and extracts the predicted pocket center (X, Y, Z)."""
     pdb_path = f"{SHARED_ROOT}/00_targets/{target}/{pdb_filename}"
     out_dir = stage_dir(run_id, target, "03_pockets")
     cmd = f"{q(P2RANK_BIN)} predict -f {q(pdb_path)} -o {q(out_dir)}"
-    run_remote_ssh("arch_4070", cmd, "P2Rank-PocketFinder")
+    run_remote_ssh("arch_4070", cmd, "P2Rank-PocketFinder", dry_run=dry_run)
 
     predictions_csv = f"{out_dir}/{pdb_filename}_predictions.csv"
+    if dry_run:
+        print(f"[dry-run] P2Rank output would be: {predictions_csv}")
+        return 0.0, 0.0, 0.0, pdb_path
     df = pd.read_csv(predictions_csv, skipinitialspace=True)
-    if df.empty:
-        raise RuntimeError(f"P2Rank found no pockets for {pdb_filename}")
-    # Select Rank 1 catalytic pocket for LRRK2, or Rank 2 allosteric chaperone pocket for GBA1
-    pocket_idx = 0 if target.upper() == "LRRK2" else (1 if len(df) > 1 else 0)
-    row = df.iloc[pocket_idx]
-    cx, cy, cz = float(row["center_x"]), float(row["center_y"]), float(row["center_z"])
+    pocket_idx, cx, cy, cz = select_pocket(df, target)
     print(f"[Pocket Coords] Selected Pocket #{pocket_idx+1} for {target}: X={cx:.2f}, Y={cy:.2f}, Z={cz:.2f}")
     return cx, cy, cz, pdb_path
 
@@ -254,7 +286,11 @@ def main():
                         help="Unique run identifier (auto-generated as YYYYMMDD_HHMMSS if omitted)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip stages whose outputs already exist in the run directory")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the remote commands that would run, without executing them")
     args = parser.parse_args()
+
+    dry_run = args.dry_run
 
     run_id = args.run_id or now_str()
     raw_smiles = os.path.realpath(args.raw_smiles)
@@ -281,6 +317,9 @@ def main():
 
     if args.resume and stage_done(manifest, "cns_filter") and os.path.isfile(cns_csv):
         print("=== STAGE 1: BBB & CNS Ligand Filtering (skipped, already done) ===")
+    elif dry_run and not os.path.isfile(raw_smiles):
+        print(f"[dry-run] STAGE 1 skipped: raw SMILES file not found at {raw_smiles}")
+        print("[dry-run] build it first with: python scripts/build_chembl_library.py")
     else:
         print("=== STAGE 1: BBB & CNS Ligand Filtering (Mac mini M2) ===")
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -290,7 +329,8 @@ def main():
         ], check=True)
         if len(pd.read_csv(cns_csv)) == 0:
             sys.exit("[PIPELINE COMPLETE] No ligands passed the CNS filter.")
-        mark_stage_done(manifest, "cns_filter", {"cns_csv": cns_csv, "ligands": len(pd.read_csv(cns_csv))})
+        if not dry_run:
+            mark_stage_done(manifest, "cns_filter", {"cns_csv": cns_csv, "ligands": len(pd.read_csv(cns_csv))})
 
     # ------------------------------------------------------------------
     # STAGE 2: Locate Binding Pocket via P2Rank on arch_4070
@@ -300,17 +340,16 @@ def main():
         print("=== STAGE 2: Binding Pocket Identification (skipped, already done) ===")
         # Still need coords; re-read from existing CSV.
         df = pd.read_csv(pocket_csv, skipinitialspace=True)
-        pocket_idx = 0 if args.target.upper() == "LRRK2" else (1 if len(df) > 1 else 0)
-        row = df.iloc[pocket_idx]
-        cx, cy, cz = float(row["center_x"]), float(row["center_y"]), float(row["center_z"])
+        pocket_idx, cx, cy, cz = select_pocket(df, args.target)
         pdb_path = f"{SHARED_ROOT}/00_targets/{args.target}/{args.pdb}"
     else:
         print("\n=== STAGE 2: Binding Pocket Identification (Arch 4070 Ti Super) ===")
-        cx, cy, cz, pdb_path = get_top_pocket_coords(run_id, args.target, args.pdb)
-        mark_stage_done(manifest, "pocket_finder", {
-            "pocket_csv": pocket_csv,
-            "coords": {"x": cx, "y": cy, "z": cz},
-        })
+        cx, cy, cz, pdb_path = get_top_pocket_coords(run_id, args.target, args.pdb, dry_run=dry_run)
+        if not dry_run:
+            mark_stage_done(manifest, "pocket_finder", {
+                "pocket_csv": pocket_csv,
+                "coords": {"x": cx, "y": cy, "z": cz},
+            })
 
     # ------------------------------------------------------------------
     # STAGE 3: Parallel Dual-Node GPU Execution
@@ -318,7 +357,10 @@ def main():
     diffdock_dir = stage_dir(run_id, args.target, "04_diffdock")
     gnina_dir = stage_dir(run_id, args.target, "05_gnina")
     diffdock_csv = os.path.join(gnina_dir, f"{args.target}_diffdock_input.csv")
-    build_diffdock_csv(pdb_path, cns_csv, diffdock_csv)
+    if dry_run and not os.path.isfile(cns_csv):
+        print(f"[dry-run] DiffDock input CSV would be built from {cns_csv} -> {diffdock_csv}")
+    else:
+        build_diffdock_csv(pdb_path, cns_csv, diffdock_csv)
 
     diffdock_out = os.path.join(diffdock_dir, args.target)
     gnina_out_sdf = os.path.join(gnina_dir, f"{args.target}_docked.sdf")
@@ -374,28 +416,32 @@ def main():
     if futures:
         with ThreadPoolExecutor(max_workers=2) as pool:
             pool_futures = [
-                pool.submit(run_remote_ssh, node, cmd, label)
+                pool.submit(run_remote_ssh, node, cmd, label, dry_run=dry_run)
                 for node, cmd, label in futures
             ]
             for fut in pool_futures:
                 fut.result()
 
-    if not diffdock_done:
-        mark_stage_done(manifest, "diffdock", {"diffdock_out": diffdock_out})
-    if not gnina_dock_done:
-        mark_stage_done(manifest, "gnina_dock", {"gnina_out_sdf": gnina_out_sdf})
+    if not dry_run:
+        if not diffdock_done:
+            mark_stage_done(manifest, "diffdock", {"diffdock_out": diffdock_out})
+        if not gnina_dock_done:
+            mark_stage_done(manifest, "gnina_dock", {"gnina_out_sdf": gnina_out_sdf})
 
     # ------------------------------------------------------------------
     # STAGE 3b: GNINA Rescoring of DiffDock Poses
     # ------------------------------------------------------------------
     print("\n=== STAGE 3b: GNINA Rescoring of DiffDock Poses (Arch 2080 Super) ===")
-    n_poses = combine_diffdock_poses(diffdock_out, combined_sdf)
+    n_poses = 0 if dry_run else combine_diffdock_poses(diffdock_out, combined_sdf)
     rescore_done = (
         args.resume and stage_done(manifest, "gnina_rescore")
         and os.path.isfile(rescored_sdf)
     )
     if rescore_done:
         print("[Rescore] GNINA rescoring skipped (already done).")
+    elif dry_run:
+        print(f"[dry-run] would combine DiffDock poses from {diffdock_out} into {combined_sdf}")
+        print(f"[dry-run] would then rescore with GNINA on arch_2080 -> {rescored_sdf}")
     elif n_poses:
         run_remote_ssh("arch_2080", gnina_docker_cmd(gpu_2080, (
             f"-r {q(pdb_path)} -l {q(combined_sdf)} --score_only "
@@ -427,6 +473,13 @@ def main():
         print("[Triage] Hit extraction skipped (already done).")
         poses = collect_poses(gnina_out_sdf, "gnina_dock") + collect_poses(rescored_sdf, "diffdock_rescored")
         num_hits = len(pd.read_csv(top_hits_csv)) if os.path.isfile(top_hits_csv) else 0
+    elif dry_run:
+        print(f"[dry-run] would extract top hits from {gnina_out_sdf} + {rescored_sdf}")
+        print(f"[dry-run] top hits CSV would be: {top_hits_csv}")
+        print(f"[dry-run] ADMET-AI would run on arch_2080 -> {admet_out_csv}")
+        print(f"[dry-run] final safe leads would be: {final_summary}")
+        print("[dry-run] stages 2-4 not executed; command surface verified only.")
+        return
     else:
         poses = collect_poses(gnina_out_sdf, "gnina_dock") + collect_poses(rescored_sdf, "diffdock_rescored")
         num_hits = extract_top_hits(poses, cns_csv, top_hits_csv)

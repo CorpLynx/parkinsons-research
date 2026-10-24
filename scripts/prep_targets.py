@@ -16,7 +16,7 @@ MAX_MODELED_GAP = 10  # residues; longer missing loops are left unmodeled
 def download_pdb(pdb_id, dest):
     pdb_id = validate_pdb_id(pdb_id)
     url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-    with urllib.request.urlopen(url, timeout=60) as resp:  # nosec B310 - fixed https host
+    with urllib.request.urlopen(url, timeout=60) as resp:  # nosec B310 - fixed https host  # noqa: S310
         data = resp.read(MAX_DOWNLOAD_BYTES + 1)
     if len(data) > MAX_DOWNLOAD_BYTES:
         raise RuntimeError(f"{pdb_id}: download exceeds size limit")

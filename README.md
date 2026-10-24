@@ -310,24 +310,82 @@ The script lives in [`scripts/master_pipeline.py`](scripts/master_pipeline.py) i
 
 ## 7. Quick-Start Execution Commands
 
-Once your NFS share is mounted at `/mnt/pd_research` across all three nodes, run your entire campaign from the **Mac mini M2**:
+### 7.1 One-shot install (Mac mini M2)
 
 ```bash
-# 1. Activate the Mac mini M2 environment
+cd /path/to/parkinsons-research
+bash scripts/install.sh --shared-root /mnt/pd_research
+# then edit .env with your Arch node host/user/GPU settings
+set -a; source .env; set +a
+```
+
+### 7.2 Run the pipeline
+
+Each invocation creates a versioned run directory under
+`$PD_SHARED_ROOT/runs/{RUN_ID}/{target}/`, so repeated campaigns never clobber
+each other and every run keeps a `manifest.json`.
+
+```bash
+# Verify the full remote command surface WITHOUT touching the GPU nodes
+./scripts/run_pipeline.sh --target LRRK2 --pdb 7LHT_clean.pdb --dry-run
+
+# Real run (Stages 2-4 need the Arch GPU nodes)
+./scripts/run_pipeline.sh --target LRRK2 --pdb 7LHT_clean.pdb
+./scripts/run_pipeline.sh --target GBA1   --pdb 2V3D_clean.pdb
+
+# Resume a crashed run (skips stages whose outputs already exist)
+./scripts/run_pipeline.sh --target LRRK2 --pdb 7LHT_clean.pdb \
+  --run-id 20261024_093000 --resume
+
+# List previous campaigns
+./scripts/run_pipeline.sh --list-runs
+
+# Stage 1 only (CNS filter; no Arch nodes required)
+./scripts/run_pipeline.sh --local
+```
+
+### 7.3 Manual invocation
+
+If you prefer to drive the steps directly:
+
+```bash
 micromamba activate chem_m2
 
-# 2. Download and protonate LRRK2 (pH 7.4) and GBA1 (pH 5.5)
+# Download and protonate LRRK2 (pH 7.4) and GBA1 (pH 5.5)
 python3 /mnt/pd_research/scripts/prep_targets.py
 
-# 3. Launch a multi-node screen against LRRK2 (G2019S kinase pocket)
+# Build the curated ChEMBL library (LRRK2 + GBA1 compounds)
+python3 /mnt/pd_research/scripts/build_chembl_library.py \
+  --output /mnt/pd_research/01_ligands_raw/chembl_lrrk2_gba1_library.csv
+
+# Launch a multi-node screen against LRRK2 (WT full-length kinase pocket)
 python3 /mnt/pd_research/scripts/master_pipeline.py \
   --target LRRK2 \
   --pdb 7LHT_clean.pdb
 
-# 4. Launch a multi-node screen for GBA1 allosteric lysosomal chaperones
+# Launch a multi-node screen for GBA1 allosteric lysosomal chaperones
 python3 /mnt/pd_research/scripts/master_pipeline.py \
   --target GBA1 \
   --pdb 2V3D_clean.pdb
+```
+
+### 7.4 Where results land
+
+```
+$PD_SHARED_ROOT/runs/{RUN_ID}/{target}/
+├── 02_cns/          CNS-filtered SDF + CSV
+├── 03_pockets/      P2Rank pocket predictions
+├── 04_diffdock/     DiffDock poses
+├── 05_gnina/        GNINA docked + rescored SDFs, DiffDock input CSV
+├── 06_admet/        Top hits, ADMET output, FINAL_SAFE_LEADS.csv
+└── manifest.json    Run metadata, stage completion, lead counts
+```
+
+Summarise any run with:
+
+```bash
+python3 scripts/check_pipeline.py \
+  $PD_SHARED_ROOT/runs/{RUN_ID}/{target}/06_admet/{target}_FINAL_SAFE_LEADS.csv
 ```
 
 ---
@@ -339,6 +397,22 @@ Before launching large-scale screening batches, verify each item below:
 - [ ] **Arch Driver Check:** Running `nvidia-smi` on `arch-4070` shows **RTX 4070 Ti Super (16376 MiB)** and on `arch-2080` shows **RTX 2080 Super (8192 MiB)** with `nvidia-open-dkms` active.
 - [ ] **Arch Docker GPU Check:** Running `docker run --rm --gpus all gnina/gnina:latest gnina --version` on `arch-2080` prints the GNINA version without `libstdc++` or CUDA errors.
 - [ ] **SSH Mesh Check:** Running `ssh archuser@192.168.1.100 "nvidia-smi"` and `ssh archuser@192.168.1.101 "nvidia-smi"` from the **Mac mini M2** succeeds without prompting for a password.
+- [ ] **Dry-Run Check:** Running `./scripts/run_pipeline.sh --target LRRK2 --pdb 7LHT_clean.pdb --dry-run` prints every remote command (P2Rank, DiffDock, GNINA, ADMET-AI) with resolved paths and quoting, without opening an SSH connection. Do this **before** every first run on the GPU nodes.
 - [ ] **Smoke Test:** `pip install -r requirements-dev.txt && pytest` passes on the Mac mini, and `python scripts/smoke_test.py` builds the curated ChEMBL library and filters it to CNS-penetrant 3D ligands (MLi-2 survives the BBB filter).
 - [ ] **Shared NFS Storage Check:** Creating a test file `touch /mnt/pd_research/test.txt` on the Mac mini M2 is immediately visible on both `arch-4070` and `arch-2080`.
 - [ ] **DiffDock PyG Check:** Running `~/.local/bin/micromamba run -n diffdock python -c "import torch, torch_scatter; print(torch.cuda.is_available())"` on `arch-4070` returns `True`.
+
+---
+
+## 9. Continuous Integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request:
+
+| Job | What it does |
+|-----|--------------|
+| `lint` | `ruff check .`, `bandit -r scripts -ll`, `pip-audit` |
+| `test` | `pytest` (54 tests) + uploads the JUnit report |
+| `smoke` | Live end-to-end Stage 1: builds the curated ChEMBL library from the ChEMBL API and CNS-filters it; uploads the artifacts |
+
+The `smoke` job hits the live ChEMBL API, so it is the check that catches a broken
+library build before it reaches your laptop.
