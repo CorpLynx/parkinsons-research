@@ -339,6 +339,6 @@ Before launching large-scale screening batches, verify each item below:
 - [ ] **Arch Driver Check:** Running `nvidia-smi` on `arch-4070` shows **RTX 4070 Ti Super (16376 MiB)** and on `arch-2080` shows **RTX 2080 Super (8192 MiB)** with `nvidia-open-dkms` active.
 - [ ] **Arch Docker GPU Check:** Running `docker run --rm --gpus all gnina/gnina:latest gnina --version` on `arch-2080` prints the GNINA version without `libstdc++` or CUDA errors.
 - [ ] **SSH Mesh Check:** Running `ssh archuser@192.168.1.100 "nvidia-smi"` and `ssh archuser@192.168.1.101 "nvidia-smi"` from the **Mac mini M2** succeeds without prompting for a password.
-- [ ] **Smoke Test:** `pip install -r requirements-dev.txt && pytest` passes on the Mac mini, and `python scripts/cns_filter.py` on the starter library produces an SDF.
+- [ ] **Smoke Test:** `pip install -r requirements-dev.txt && pytest` passes on the Mac mini, and `python scripts/smoke_test.py` builds the curated ChEMBL library and filters it to CNS-penetrant 3D ligands (MLi-2 survives the BBB filter).
 - [ ] **Shared NFS Storage Check:** Creating a test file `touch /mnt/pd_research/test.txt` on the Mac mini M2 is immediately visible on both `arch-4070` and `arch-2080`.
 - [ ] **DiffDock PyG Check:** Running `~/.local/bin/micromamba run -n diffdock python -c "import torch, torch_scatter; print(torch.cuda.is_available())"` on `arch-4070` returns `True`.

@@ -258,3 +258,59 @@ def test_pdb_construct_verification():
         assert pd_common.validate_pdb_id(cfg["pdb_id"]) == cfg["pdb_id"].upper()
     print("[check] PDB constructs: LRRK2=7LHT (WT full-length), GBA1=2V3D "
           "(human acid beta-glucosidase); 6N3F rejected (not GBA1)")
+
+
+def test_check_pipeline_report_flat(tmp_path, monkeypatch, capsys):
+    """check_pipeline.report() on a validated-candidates CSV (no CNNscore column)."""
+    import check_pipeline as cp
+
+    df = pd.DataFrame({
+        "ligand_id": ["LRRK2_CHEMBL4098877", "GBA1_CHEMBL153479", "LRRK2_X"],
+        "target": ["LRRK2", "GBA1", "LRRK2"],
+        "chembl_id": ["CHEMBL4098877", "CHEMBL153479", "CHEMBL_X"],
+        "BBB_Martins": [0.90, 0.85, 0.50],
+        "hERG": [0.10, 0.10, 0.10],
+        "DILI": [0.20, 0.20, 0.20],
+    })
+    p = tmp_path / "candidates.csv"
+    df.to_csv(p, index=False)
+    safe = cp.report(df, p.name)
+    assert len(safe) == 2  # LRRK2_X fails BBB (0.50 < 0.80)
+    assert set(safe["ligand_id"]) == {"LRRK2_CHEMBL4098877", "GBA1_CHEMBL153479"}
+    captured = capsys.readouterr()
+    assert "Safe leads (all three pass): 2" in captured.out
+    assert "MLi-2 (LRRK2) (CHEMBL4098877): present" in captured.out
+
+
+def test_check_pipeline_report_with_cnnscore(tmp_path):
+    """check_pipeline.report() ranks top leads by CNNscore when present."""
+    import check_pipeline as cp
+
+    df = pd.DataFrame({
+        "ligand_id": ["LRRK2_CHEMBL4098877", "LRRK2_Y", "GBA1_CHEMBL153479"],
+        "target": ["LRRK2", "LRRK2", "GBA1"],
+        "chembl_id": ["CHEMBL4098877", "CHEMBL_Y", "CHEMBL153479"],
+        "CNNscore": [0.90, 0.70, 0.80],
+        "CNNaffinity": [-7.0, -5.0, -6.0],
+        "BBB_Martins": [0.90, 0.90, 0.85],
+        "hERG": [0.10, 0.10, 0.50],
+        "DILI": [0.20, 0.20, 0.20],
+        "smiles": ["C", "CC", "CCC"],
+    })
+    p = tmp_path / "safe_leads.csv"
+    df.to_csv(p, index=False)
+    safe = cp.report(df, p.name)
+    assert len(safe) == 2  # GBA1_CHEMBL153479 fails hERG (0.50 > 0.30)
+    top = safe.sort_values("CNNscore", ascending=False)
+    assert top.iloc[0]["ligand_id"] == "LRRK2_CHEMBL4098877"
+    assert top.iloc[0]["CNNscore"] == 0.90
+
+
+def test_check_pipeline_empty(tmp_path):
+    """check_pipeline.report() handles an empty CSV without crashing."""
+    import check_pipeline as cp
+
+    p = tmp_path / "empty.csv"
+    pd.DataFrame(columns=["ligand_id", "target", "BBB_Martins", "hERG", "DILI"]).to_csv(p, index=False)
+    df = cp.load_csv(p)
+    assert df.empty

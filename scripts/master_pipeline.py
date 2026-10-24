@@ -186,9 +186,9 @@ def main():
     parser = argparse.ArgumentParser(description="Arch Linux + Mac mini M2 Parkinson's Pipeline Orchestrator")
     parser.add_argument("--target", required=True, choices=["LRRK2", "GBA1"], help="Target Parkinson's protein")
     parser.add_argument("--pdb", required=True, type=validate_pdb_filename,
-                        help="Cleaned PDB filename (e.g., 7LHT_clean.pdb or 6N3F_clean.pdb)")
-    parser.add_argument("--raw_smiles", default=f"{SHARED_ROOT}/01_ligands_raw/cns_starter.csv",
-                        help="Path to raw SMILES CSV")
+                        help="Cleaned PDB filename (e.g., 7LHT_clean.pdb or 2V3D_clean.pdb)")
+    parser.add_argument("--raw_smiles", default=f"{SHARED_ROOT}/01_ligands_raw/chembl_lrrk2_gba1_library.csv",
+                        help="Path to raw SMILES CSV (default: curated ChEMBL LRRK2/GBA1 library)")
     args = parser.parse_args()
 
     raw_smiles = os.path.realpath(args.raw_smiles)
