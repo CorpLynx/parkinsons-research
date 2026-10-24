@@ -5,10 +5,16 @@ Coordinates ligand filtering (M2), P2Rank + DiffDock (Arch 4070 Ti Super),
 Dockerized 3D CNN GNINA screening and DiffDock pose rescoring (Arch 2080 Super),
 and ADMET-AI triage (Arch 2080 Super).
 
+Each invocation creates a versioned run directory under
+{SHARED_ROOT}/runs/{RUN_ID}/{target}/ so multiple campaigns can be run,
+compared, and resumed without clobbering previous results.
+
 Node addresses/users come from environment variables (see .env.example).
 Remote hosts must already be in ~/.ssh/known_hosts; unknown hosts are rejected.
 """
 import argparse
+import datetime
+import json
 import os
 import shlex
 import subprocess
@@ -79,10 +85,64 @@ def run_remote_ssh(node_key, command, stage_label):
     print(f"[{stage_label}] Completed successfully.")
 
 
-def get_top_pocket_coords(target_name, pdb_filename):
+def now_str():
+    """Current timestamp as a compact run-ID-friendly string."""
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def run_root(run_id):
+    """Top-level directory for a run: {SHARED_ROOT}/runs/{run_id}/"""
+    return os.path.join(SHARED_ROOT, "runs", run_id)
+
+
+def target_run_dir(run_id, target):
+    """Per-target run directory: {SHARED_ROOT}/runs/{run_id}/{target}/"""
+    return os.path.join(run_root(run_id), target)
+
+
+def stage_dir(run_id, target, stage_name):
+    """Directory for a pipeline stage output: .../{run_id}/{target}/{stage_name}/"""
+    d = os.path.join(target_run_dir(run_id, target), stage_name)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def manifest_path(run_id, target):
+    return os.path.join(target_run_dir(run_id, target), "manifest.json")
+
+
+def load_manifest(run_id, target):
+    p = manifest_path(run_id, target)
+    if os.path.isfile(p):
+        with open(p) as fh:
+            return json.load(fh)
+    return {"run_id": run_id, "target": target, "stages": {}, "status": "running"}
+
+
+def save_manifest(run_id, target, manifest):
+    p = manifest_path(run_id, target)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+
+
+def stage_done(manifest, stage_name):
+    return manifest.get("stages", {}).get(stage_name, {}).get("done", False)
+
+
+def mark_stage_done(manifest, stage_name, detail=None):
+    manifest.setdefault("stages", {})[stage_name] = {
+        "done": True,
+        "finished_at": datetime.datetime.now().isoformat(),
+        "detail": detail or {},
+    }
+    save_manifest(manifest["run_id"], manifest["target"], manifest)
+
+
+def get_top_pocket_coords(run_id, target, pdb_filename):
     """Runs P2Rank on arch_4070 and extracts the predicted pocket center (X, Y, Z)."""
-    pdb_path = f"{SHARED_ROOT}/00_targets/{target_name}/{pdb_filename}"
-    out_dir = f"{SHARED_ROOT}/03_pockets/{target_name}"
+    pdb_path = f"{SHARED_ROOT}/00_targets/{target}/{pdb_filename}"
+    out_dir = stage_dir(run_id, target, "03_pockets")
     cmd = f"{q(P2RANK_BIN)} predict -f {q(pdb_path)} -o {q(out_dir)}"
     run_remote_ssh("arch_4070", cmd, "P2Rank-PocketFinder")
 
@@ -91,10 +151,10 @@ def get_top_pocket_coords(target_name, pdb_filename):
     if df.empty:
         raise RuntimeError(f"P2Rank found no pockets for {pdb_filename}")
     # Select Rank 1 catalytic pocket for LRRK2, or Rank 2 allosteric chaperone pocket for GBA1
-    pocket_idx = 0 if target_name.upper() == "LRRK2" else (1 if len(df) > 1 else 0)
+    pocket_idx = 0 if target.upper() == "LRRK2" else (1 if len(df) > 1 else 0)
     row = df.iloc[pocket_idx]
     cx, cy, cz = float(row["center_x"]), float(row["center_y"]), float(row["center_z"])
-    print(f"[Pocket Coords] Selected Pocket #{pocket_idx+1} for {target_name}: X={cx:.2f}, Y={cy:.2f}, Z={cz:.2f}")
+    print(f"[Pocket Coords] Selected Pocket #{pocket_idx+1} for {target}: X={cx:.2f}, Y={cy:.2f}, Z={cz:.2f}")
     return cx, cy, cz, pdb_path
 
 
@@ -160,14 +220,15 @@ def extract_top_hits(poses, filtered_csv, top_hits_csv, min_cnn_score=MIN_CNN_SC
     return len(df)
 
 
-def gnina_docker_cmd(gpu_id, args):
+def gnina_docker_cmd(gpu_id, args, run_id, target):
     """Hardened GNINA container invocation: no extra privileges, non-root, read-only inputs."""
+    run_target = target_run_dir(run_id, target)
     return (
         f"docker run --rm --gpus {q(chr(34) + 'device=' + gpu_id + chr(34))} "
         f"--cap-drop ALL --security-opt no-new-privileges "
         f"--user \"$(id -u):$(id -g)\" "
         f"-v {q(SHARED_ROOT)}:{q(SHARED_ROOT)}:ro "
-        f"-v {q(SHARED_ROOT + '/05_gnina_rescored')}:{q(SHARED_ROOT + '/05_gnina_rescored')} "
+        f"-v {q(run_target)}:{q(run_target)} "
         f"{q(GNINA_IMAGE)} gnina {args}"
     )
 
@@ -189,42 +250,96 @@ def main():
                         help="Cleaned PDB filename (e.g., 7LHT_clean.pdb or 2V3D_clean.pdb)")
     parser.add_argument("--raw_smiles", default=f"{SHARED_ROOT}/01_ligands_raw/chembl_lrrk2_gba1_library.csv",
                         help="Path to raw SMILES CSV (default: curated ChEMBL LRRK2/GBA1 library)")
+    parser.add_argument("--run-id", default=None,
+                        help="Unique run identifier (auto-generated as YYYYMMDD_HHMMSS if omitted)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip stages whose outputs already exist in the run directory")
     args = parser.parse_args()
 
+    run_id = args.run_id or now_str()
     raw_smiles = os.path.realpath(args.raw_smiles)
     if not raw_smiles.startswith(os.path.realpath(SHARED_ROOT) + os.sep):
         sys.exit(f"--raw_smiles must live under {SHARED_ROOT}")
 
-    # Stage 1: Filter SMILES for Blood-Brain Barrier on Mac mini M2
-    cns_sdf = f"{SHARED_ROOT}/02_ligands_cns_filtered/{args.target}_cns.sdf"
-    cns_csv = f"{SHARED_ROOT}/02_ligands_cns_filtered/{args.target}_cns.csv"
-    print("=== STAGE 1: BBB & CNS Ligand Filtering (Mac mini M2) ===")
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    subprocess.run([  # noqa: S603 - fixed interpreter and script, validated paths
-        sys.executable, os.path.join(script_dir, "cns_filter.py"),
-        raw_smiles, cns_sdf, cns_csv
-    ], check=True)
-    if len(pd.read_csv(cns_csv)) == 0:
-        sys.exit("[PIPELINE COMPLETE] No ligands passed the CNS filter.")
+    manifest = load_manifest(run_id, args.target)
+    manifest["run_id"] = run_id
+    manifest["target"] = args.target
+    manifest["pdb"] = args.pdb
+    manifest["raw_smiles"] = raw_smiles
+    manifest.setdefault("started_at", datetime.datetime.now().isoformat())
+    save_manifest(run_id, args.target, manifest)
 
-    # Stage 2: Locate Binding Pocket via P2Rank on arch_4070
-    print("\n=== STAGE 2: Binding Pocket Identification (Arch 4070 Ti Super) ===")
-    cx, cy, cz, pdb_path = get_top_pocket_coords(args.target, args.pdb)
+    tr = target_run_dir(run_id, args.target)
+    print(f"=== Pipeline run {run_id} | target={args.target} | run_dir={tr} ===")
 
-    diffdock_csv = f"{SHARED_ROOT}/scripts/{args.target}_diffdock_input.csv"
+    # ------------------------------------------------------------------
+    # STAGE 1: BBB & CNS Ligand Filtering (Mac mini M2)
+    # ------------------------------------------------------------------
+    cns_dir = stage_dir(run_id, args.target, "02_cns")
+    cns_sdf = os.path.join(cns_dir, f"{args.target}_cns.sdf")
+    cns_csv = os.path.join(cns_dir, f"{args.target}_cns.csv")
+
+    if args.resume and stage_done(manifest, "cns_filter") and os.path.isfile(cns_csv):
+        print("=== STAGE 1: BBB & CNS Ligand Filtering (skipped, already done) ===")
+    else:
+        print("=== STAGE 1: BBB & CNS Ligand Filtering (Mac mini M2) ===")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run([  # noqa: S603 - fixed interpreter and script, validated paths
+            sys.executable, os.path.join(script_dir, "cns_filter.py"),
+            raw_smiles, cns_sdf, cns_csv
+        ], check=True)
+        if len(pd.read_csv(cns_csv)) == 0:
+            sys.exit("[PIPELINE COMPLETE] No ligands passed the CNS filter.")
+        mark_stage_done(manifest, "cns_filter", {"cns_csv": cns_csv, "ligands": len(pd.read_csv(cns_csv))})
+
+    # ------------------------------------------------------------------
+    # STAGE 2: Locate Binding Pocket via P2Rank on arch_4070
+    # ------------------------------------------------------------------
+    pocket_csv = f"{stage_dir(run_id, args.target, '03_pockets')}/{args.pdb}_predictions.csv"
+    if args.resume and stage_done(manifest, "pocket_finder") and os.path.isfile(pocket_csv):
+        print("=== STAGE 2: Binding Pocket Identification (skipped, already done) ===")
+        # Still need coords; re-read from existing CSV.
+        df = pd.read_csv(pocket_csv, skipinitialspace=True)
+        pocket_idx = 0 if args.target.upper() == "LRRK2" else (1 if len(df) > 1 else 0)
+        row = df.iloc[pocket_idx]
+        cx, cy, cz = float(row["center_x"]), float(row["center_y"]), float(row["center_z"])
+        pdb_path = f"{SHARED_ROOT}/00_targets/{args.target}/{args.pdb}"
+    else:
+        print("\n=== STAGE 2: Binding Pocket Identification (Arch 4070 Ti Super) ===")
+        cx, cy, cz, pdb_path = get_top_pocket_coords(run_id, args.target, args.pdb)
+        mark_stage_done(manifest, "pocket_finder", {
+            "pocket_csv": pocket_csv,
+            "coords": {"x": cx, "y": cy, "z": cz},
+        })
+
+    # ------------------------------------------------------------------
+    # STAGE 3: Parallel Dual-Node GPU Execution
+    # ------------------------------------------------------------------
+    diffdock_dir = stage_dir(run_id, args.target, "04_diffdock")
+    gnina_dir = stage_dir(run_id, args.target, "05_gnina")
+    diffdock_csv = os.path.join(gnina_dir, f"{args.target}_diffdock_input.csv")
     build_diffdock_csv(pdb_path, cns_csv, diffdock_csv)
 
-    # Stage 3: Parallel Dual-Node GPU Execution (Arch 4070 Ti Super + Arch 2080 Super)
-    print("\n=== STAGE 3: Parallel Multi-Node Docking (Arch 4070 Ti Super + Arch 2080 Super) ===")
-    diffdock_out = f"{SHARED_ROOT}/04_diffdock_poses/{args.target}"
-    gnina_out_sdf = f"{SHARED_ROOT}/05_gnina_rescored/{args.target}_docked.sdf"
-    rescored_sdf = f"{SHARED_ROOT}/05_gnina_rescored/{args.target}_diffdock_rescored.sdf"
-    combined_sdf = f"{SHARED_ROOT}/05_gnina_rescored/{args.target}_diffdock_top_poses.sdf"
+    diffdock_out = os.path.join(diffdock_dir, args.target)
+    gnina_out_sdf = os.path.join(gnina_dir, f"{args.target}_docked.sdf")
+    rescored_sdf = os.path.join(gnina_dir, f"{args.target}_diffdock_rescored.sdf")
+    combined_sdf = os.path.join(gnina_dir, f"{args.target}_diffdock_top_poses.sdf")
 
     nodes = get_nodes()
     gpu_4070 = nodes["arch_4070"]["gpu_id"]
     gpu_2080 = nodes["arch_2080"]["gpu_id"]
 
+    diffdock_done = (
+        args.resume and stage_done(manifest, "diffdock")
+        and os.path.isdir(diffdock_out)
+        and any(f.endswith("rank1.sdf") for f in os.listdir(diffdock_out))
+    ) if os.path.isdir(diffdock_out) else False
+    gnina_dock_done = (
+        args.resume and stage_done(manifest, "gnina_dock")
+        and os.path.isfile(gnina_out_sdf)
+    )
+
+    print("\n=== STAGE 3: Parallel Multi-Node Docking (Arch 4070 Ti Super + Arch 2080 Super) ===")
     cmd_arch4070_diffdock = (
         f"cd {q(DIFFDOCK_DIR)} && "
         f"CUDA_VISIBLE_DEVICES={q(gpu_4070)} {remote_path(MAMBA_BIN)} run -n diffdock python -m inference "
@@ -234,58 +349,123 @@ def main():
     )
 
     cmd_arch2080_gnina = (
-        f"mkdir -p {q(SHARED_ROOT + '/05_gnina_rescored')} && " +
+        f"mkdir -p {q(gnina_dir)} && " +
         gnina_docker_cmd(gpu_2080, (
-            f"-r {q(pdb_path)} -l {q(cns_sdf)} "
+            f"-r {q(pdb_path)} -l {q(cns_csv)} "
             f"--center_x {cx:.2f} --center_y {cy:.2f} --center_z {cz:.2f} "
             f"--size_x 22 --size_y 22 --size_z 22 "
             f"--cnn_scoring rescore --cpu 4 --seed 0 -o {q(gnina_out_sdf)}"
-        ))
+        ), run_id, args.target)
     )
 
-    # Failures in either node abort the pipeline instead of being silently dropped.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [
-            pool.submit(run_remote_ssh, "arch_4070", cmd_arch4070_diffdock, "Arch4070-DiffDock"),
-            pool.submit(run_remote_ssh, "arch_2080", cmd_arch2080_gnina, "Arch2080-GNINA"),
-        ]
-        for fut in futures:
-            fut.result()
+    futures = []
+    if not diffdock_done:
+        print("[Dock] DiffDock on arch_4070 (not skipped)")
+        futures.append(("arch_4070", cmd_arch4070_diffdock, "Arch4070-DiffDock"))
+    else:
+        print("[Dock] DiffDock on arch_4070 skipped (already done)")
 
-    # Stage 3b: rescore DiffDock poses with GNINA so both docking engines feed the triage.
+    if not gnina_dock_done:
+        print("[Dock] GNINA on arch_2080 (not skipped)")
+        futures.append(("arch_2080", cmd_arch2080_gnina, "Arch2080-GNINA"))
+    else:
+        print("[Dock] GNINA on arch_2080 skipped (already done)")
+
+    if futures:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pool_futures = [
+                pool.submit(run_remote_ssh, node, cmd, label)
+                for node, cmd, label in futures
+            ]
+            for fut in pool_futures:
+                fut.result()
+
+    if not diffdock_done:
+        mark_stage_done(manifest, "diffdock", {"diffdock_out": diffdock_out})
+    if not gnina_dock_done:
+        mark_stage_done(manifest, "gnina_dock", {"gnina_out_sdf": gnina_out_sdf})
+
+    # ------------------------------------------------------------------
+    # STAGE 3b: GNINA Rescoring of DiffDock Poses
+    # ------------------------------------------------------------------
     print("\n=== STAGE 3b: GNINA Rescoring of DiffDock Poses (Arch 2080 Super) ===")
     n_poses = combine_diffdock_poses(diffdock_out, combined_sdf)
-    if n_poses:
+    rescore_done = (
+        args.resume and stage_done(manifest, "gnina_rescore")
+        and os.path.isfile(rescored_sdf)
+    )
+    if rescore_done:
+        print("[Rescore] GNINA rescoring skipped (already done).")
+    elif n_poses:
         run_remote_ssh("arch_2080", gnina_docker_cmd(gpu_2080, (
             f"-r {q(pdb_path)} -l {q(combined_sdf)} --score_only "
             f"--cnn_scoring rescore --cpu 4 -o {q(rescored_sdf)}"
-        )), "Arch2080-GNINA-Rescore")
+        ), run_id, args.target), "Arch2080-GNINA-Rescore")
+        mark_stage_done(manifest, "gnina_rescore", {
+            "combined_sdf": combined_sdf,
+            "rescored_sdf": rescored_sdf,
+            "n_poses": n_poses,
+        })
     else:
         print("[Rescore] No DiffDock poses found; continuing with GNINA docking results only.")
+        mark_stage_done(manifest, "gnina_rescore", {"n_poses": 0, "skipped": True})
 
-    # Stage 4: Extract Top Hits on Mac mini M2 & Run ADMET-AI on Arch 2080 Super
+    # ------------------------------------------------------------------
+    # STAGE 4: Hit Triage & Neuro-ADMET Validation
+    # ------------------------------------------------------------------
     print("\n=== STAGE 4: Hit Triage & Neuro-ADMET Validation (Arch 2080 Super) ===")
-    top_hits_csv = f"{SHARED_ROOT}/05_gnina_rescored/{args.target}_top_hits.csv"
-    admet_out_csv = f"{SHARED_ROOT}/06_final_hits_admet/{args.target}_validated_candidates.csv"
+    admet_dir = stage_dir(run_id, args.target, "06_admet")
+    top_hits_csv = os.path.join(admet_dir, f"{args.target}_top_hits.csv")
+    admet_out_csv = os.path.join(admet_dir, f"{args.target}_validated_candidates.csv")
+    final_summary = os.path.join(admet_dir, f"{args.target}_FINAL_SAFE_LEADS.csv")
 
-    poses = collect_poses(gnina_out_sdf, "gnina_dock") + collect_poses(rescored_sdf, "diffdock_rescored")
-    num_hits = extract_top_hits(poses, cns_csv, top_hits_csv)
-    if num_hits > 0:
+    triage_done = (
+        args.resume and stage_done(manifest, "hit_triage")
+        and os.path.isfile(top_hits_csv)
+    )
+    if triage_done:
+        print("[Triage] Hit extraction skipped (already done).")
+        poses = collect_poses(gnina_out_sdf, "gnina_dock") + collect_poses(rescored_sdf, "diffdock_rescored")
+        num_hits = len(pd.read_csv(top_hits_csv)) if os.path.isfile(top_hits_csv) else 0
+    else:
+        poses = collect_poses(gnina_out_sdf, "gnina_dock") + collect_poses(rescored_sdf, "diffdock_rescored")
+        num_hits = extract_top_hits(poses, cns_csv, top_hits_csv)
+        mark_stage_done(manifest, "hit_triage", {
+            "top_hits_csv": top_hits_csv,
+            "n_hits": num_hits,
+        })
+
+    admet_done = (
+        args.resume and stage_done(manifest, "admet")
+        and os.path.isfile(admet_out_csv)
+    )
+    if num_hits > 0 and not admet_done:
         cmd_arch2080_admet = (
-            f"mkdir -p {q(SHARED_ROOT + '/06_final_hits_admet')} && "
+            f"mkdir -p {q(admet_dir)} && "
             f"CUDA_VISIBLE_DEVICES={q(gpu_2080)} {remote_path(MAMBA_BIN)} run -n admet admet_predict "
             f"--data_path {q(top_hits_csv)} --save_path {q(admet_out_csv)} --smiles_column smiles"
         )
         run_remote_ssh("arch_2080", cmd_arch2080_admet, "Arch2080-ADMET-AI")
+        mark_stage_done(manifest, "admet", {"admet_out_csv": admet_out_csv})
 
+    if num_hits > 0 and os.path.isfile(admet_out_csv):
         safe_bbb_leads = apply_admet_filters(pd.read_csv(admet_out_csv))
-        final_summary = f"{SHARED_ROOT}/06_final_hits_admet/{args.target}_FINAL_SAFE_LEADS.csv"
         safe_bbb_leads.to_csv(final_summary, index=False)
+        manifest["final_leads_csv"] = final_summary
+        manifest["n_final_leads"] = len(safe_bbb_leads)
+        manifest["status"] = "completed"
+        save_manifest(run_id, args.target, manifest)
         print(f"\n[PIPELINE COMPLETE] Found {len(safe_bbb_leads)} BBB-penetrant, low-predicted-toxicity leads.")
         print(f"Results saved to: {final_summary}")
         print("Note: these are in-silico predictions only; they require experimental validation.")
-    else:
+    elif num_hits == 0:
+        manifest["status"] = "completed_no_hits"
+        save_manifest(run_id, args.target, manifest)
         print("\n[PIPELINE COMPLETE] No ligands exceeded the CNNscore threshold in this batch.")
+    else:
+        manifest["status"] = "completed_partial"
+        save_manifest(run_id, args.target, manifest)
+        print("\n[PIPELINE COMPLETE] Pipeline finished but ADMET output was not found.")
 
 
 if __name__ == "__main__":

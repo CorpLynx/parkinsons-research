@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import pytest
 from rdkit import Chem
@@ -48,8 +49,9 @@ def test_remote_quoting():
 
 
 def test_gnina_cmd_is_hardened():
-    cmd = mp.gnina_docker_cmd("0", "--version")
+    cmd = mp.gnina_docker_cmd("0", "--version", "run_20260101_000000", "LRRK2")
     assert "--cap-drop ALL" in cmd and "no-new-privileges" in cmd and ":ro" in cmd
+    assert "runs/run_20260101_000000/LRRK2" in cmd
 
 
 def test_bbb_rules():
@@ -314,3 +316,54 @@ def test_check_pipeline_empty(tmp_path):
     pd.DataFrame(columns=["ligand_id", "target", "BBB_Martins", "hERG", "DILI"]).to_csv(p, index=False)
     df = cp.load_csv(p)
     assert df.empty
+
+
+def test_run_id_paths_are_versioned(tmp_path, monkeypatch):
+    """Run directories are versioned under {SHARED_ROOT}/runs/{run_id}/{target}/."""
+    import master_pipeline as mp
+
+    monkeypatch.setattr(mp, "SHARED_ROOT", str(tmp_path))
+    rid = "20261024_093000"
+    target = "LRRK2"
+
+    assert mp.run_root(rid) == os.path.join(str(tmp_path), "runs", rid)
+    assert mp.target_run_dir(rid, target) == os.path.join(str(tmp_path), "runs", rid, target)
+    d = mp.stage_dir(rid, target, "02_cns")
+    assert d == os.path.join(str(tmp_path), "runs", rid, target, "02_cns")
+    assert os.path.isdir(d)
+    assert mp.manifest_path(rid, target) == os.path.join(str(tmp_path), "runs", rid, target, "manifest.json")
+
+
+def test_manifest_round_trip(tmp_path, monkeypatch):
+    """Manifest save/load preserves run metadata and stage completion."""
+    import master_pipeline as mp
+
+    monkeypatch.setattr(mp, "SHARED_ROOT", str(tmp_path))
+    rid = "20261024_093000"
+    target = "GBA1"
+
+    m = mp.load_manifest(rid, target)
+    assert m["run_id"] == rid
+    assert m["target"] == target
+    assert m["status"] == "running"
+    assert not mp.stage_done(m, "cns_filter")
+
+    mp.mark_stage_done(m, "cns_filter", {"cns_csv": "x.csv", "ligands": 5})
+    assert mp.stage_done(m, "cns_filter")
+    assert m["stages"]["cns_filter"]["detail"]["ligands"] == 5
+
+    # Reload from disk and verify persistence
+    m2 = mp.load_manifest(rid, target)
+    assert mp.stage_done(m2, "cns_filter")
+    assert m2["stages"]["cns_filter"]["detail"]["ligands"] == 5
+
+
+def test_now_str_format():
+    """now_str() returns a compact timestamp suitable for run IDs."""
+    import master_pipeline as mp
+
+    s = mp.now_str()
+    assert len(s) == 15  # YYYYMMDD_HHMMSS
+    assert s[8] == "_"
+    assert s[:8].isdigit()
+    assert s[9:].isdigit()
