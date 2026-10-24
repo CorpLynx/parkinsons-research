@@ -1,0 +1,29 @@
+# Arch Linux node: arch-4070 (RTX 4070 Ti Super) — DiffDock environment
+# See README section 4.1.B. Pin PyTorch 2.2.2 + CUDA 12.1 to match the
+# prebuilt PyTorch Geometric wheels used by DiffDock.
+name: diffdock
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.2.2
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - biopython
+  - rdkit
+  - pandas
+  - scipy
+  - pyyaml
+  - pip
+  - pip:
+      - torch-scatter
+      - torch-sparse
+      - torch-cluster
+      - torch-spline-conv
+      - torch-geometric
+      - e3nn
+      - spyrmsd
+      - fair-esm

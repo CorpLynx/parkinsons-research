@@ -156,8 +156,105 @@ def test_chembl_library_schema_and_bbb_consistency():
 
     n_bbb = sum(1 for r in rows if r["passes_bbb"] == "True")
     assert n_bbb > 0, "library should contain BBB-penetrant compounds"
-    # Reference compound MLi-2 must be present and BBB-passing.
-    ml2 = [r for r in rows if r["chembl_id"] == "CHEMBL4098877"]
-    assert ml2, "reference MLi-2 (CHEMBL4098877) absent from library"
-    assert ml2[0]["passes_bbb"] == "True", "MLi-2 must pass BBB filter"
-    print(f"[check] library {len(rows)} compounds, {n_bbb} BBB-passing, MLi-2 present+BBB-pass")
+    # Reference compounds expected to be present + BBB-passing.
+    for chembl_id in ("CHEMBL4098877", "CHEMBL153479", "CHEMBL603469"):
+        ref = [r for r in rows if r["chembl_id"] == chembl_id]
+        assert ref, f"reference {chembl_id} absent from library"
+        assert ref[0]["passes_bbb"] == "True", f"{chembl_id} must pass BBB filter"
+    # Isofagomine/afegostat: present (GBA1 chaperone) but too polar for BBB.
+    iso = [r for r in rows if r["chembl_id"] == "CHEMBL206468"]
+    assert iso, "reference isofagomine/afegostat (CHEMBL206468) absent from library"
+    assert iso[0]["passes_bbb"] == "False", "isofagomine should fail BBB filter (polar)"
+    print(f"[check] library {len(rows)} compounds, {n_bbb} BBB-passing, "
+          f"MLi-2/ambroxol/lestaurtinib present+BBB-pass, isofagomine present+BBB-fail")
+
+
+def test_stage4_triage_known_compounds(tmp_path):
+    """Simulate Stage 4 hit triage against known LRRK2/GBA1 compounds.
+
+    Builds synthetic GNINA poses + ADMET-AI output for a handful of curated
+    compounds, then runs extract_top_hits + apply_admet_filters and asserts:
+      * best pose per ligand_id is kept (CNNscore dedup)
+      * CNNscore >= 0.65 threshold is enforced
+      * BBB >= 0.80, hERG <= 0.30, DILI <= 0.40 filters are applied
+      * a known BBB-penetrant LRRK2 inhibitor (MLi-2) survives; a polar
+        non-CNS compound is dropped.
+    """
+    # Filtered (CNS-passed) SMILES for two known compounds.
+    filt = tmp_path / "f.csv"
+    pd.DataFrame({
+        "ligand_id": ["LRRK2_CHEMBL4098877", "GBA1_CHEMBL6329", "LRRK2_DUMMY_POLAR"],
+        "smiles": [
+            "C[C@@H]1CN(c2cc(-c3n[nH]c4ccc(OC5(C)CC5)cc34)ncn2)C[C@H](C)O1",  # MLi-2
+            "Cc1cc(-n2ncc(=O)[nH]c2=O)ccc1C(=O)c1ccccc1Cl",  # ambroxol
+            "OC(=O)C(O)C(O)C(O)C(O)CO",  # polar non-CNS (glucose-like)
+        ],
+    }).to_csv(filt, index=False)
+
+    # Synthetic poses: MLi-2 has two poses (keep best=0.9), ambroxol one good pose,
+    # polar compound one sub-threshold pose (0.40).
+    poses = [
+        {"ligand_id": "LRRK2_CHEMBL4098877", "CNNscore": 0.70, "CNNaffinity": -5.0, "pose_source": "gnina_dock"},
+        {"ligand_id": "LRRK2_CHEMBL4098877", "CNNscore": 0.90, "CNNaffinity": -7.0, "pose_source": "diffdock_rescored"},
+        {"ligand_id": "GBA1_CHEMBL6329", "CNNscore": 0.80, "CNNaffinity": -6.0, "pose_source": "gnina_dock"},
+        {"ligand_id": "LRRK2_DUMMY_POLAR", "CNNscore": 0.40, "CNNaffinity": -2.0, "pose_source": "gnina_dock"},
+    ]
+    hits = tmp_path / "h.csv"
+    n = mp.extract_top_hits(poses, str(filt), str(hits))
+    assert n == 2, f"expected 2 hits above threshold, got {n}"
+    h = pd.read_csv(hits)
+    # Best pose per ligand kept: MLi-2 should be 0.90 not 0.70.
+    ml2 = h[h["ligand_id"] == "LRRK2_CHEMBL4098877"].iloc[0]
+    assert ml2["CNNscore"] == 0.90, f"MLi-2 best pose not kept: {ml2['CNNscore']}"
+    # Polar compound dropped by threshold.
+    assert "LRRK2_DUMMY_POLAR" not in set(h["ligand_id"])
+
+    # Synthetic ADMET-AI output: MLi-2 passes neuro-ADMET; ambroxol fails hERG.
+    admet = tmp_path / "admet.csv"
+    pd.DataFrame({
+        "BBB_Martins": [0.90, 0.85, 0.50],
+        "hERG": [0.10, 0.50, 0.10],
+        "DILI": [0.20, 0.20, 0.20],
+    }, index=["LRRK2_CHEMBL4098877", "GBA1_CHEMBL6329", "LRRK2_DUMMY_POLAR"]).to_csv(admet)
+    admet_df = pd.read_csv(admet)
+    admet_df.insert(0, "ligand_id", ["LRRK2_CHEMBL4098877", "GBA1_CHEMBL6329", "LRRK2_DUMMY_POLAR"])
+    safe = mp.apply_admet_filters(admet_df)
+    assert len(safe) == 1, f"expected 1 safe lead, got {len(safe)}"
+    assert safe.iloc[0]["ligand_id"] == "LRRK2_CHEMBL4098877", f"expected MLi-2 safe, got {safe.iloc[0]['ligand_id']}"
+    print("[check] stage-4 triage: 2 hits above threshold, 1 safe lead (MLi-2), ambroxol dropped on hERG")
+
+
+def test_stage4_admet_column_validation():
+    """apply_admet_filters must require all three ADMET columns."""
+    for missing in [
+        {"hERG": [0.1], "DILI": [0.2]},  # missing BBB_Martins
+        {"BBB_Martins": [0.9], "DILI": [0.2]},  # missing hERG
+        {"BBB_Martins": [0.9], "hERG": [0.1]},  # missing DILI
+    ]:
+        with pytest.raises(RuntimeError):
+            mp.apply_admet_filters(pd.DataFrame(missing))
+
+
+def test_pdb_construct_verification():
+    """PDB construct verification (README_REVIEW D / A10).
+
+    Verified against RCSB core APIs:
+      * 7LHT — full-length human LRRK2 dimer, cryo-EM 3.5 A (Cell 2021,
+        DOI:10.1016/j.cell.2021.05.004). Wild-type sequence; G2019S
+        specificity comes from ChEMBL assay data, not the PDB construct.
+      * 2V3D — human acid beta-glucosidase (GBA1), X-ray 1.96 A
+        (J Biol Chem 2007, DOI:10.1074/JBC.M705005200).
+      * 6N3F is NOT GBA1 — it is the Tat-SF1/SF3b1 complex (J Biol Chem
+        2019). The README's 6N3F mapping was replaced with 2V3D.
+    """
+    targets = pd_common.TARGETS
+    assert targets["LRRK2"]["pdb_id"] == "7LHT"
+    assert targets["GBA1"]["pdb_id"] == "2V3D"
+    assert targets["LRRK2"]["ph"] == 7.4  # cytosolic
+    assert targets["GBA1"]["ph"] == 5.5  # lysosomal
+    # 6N3F must not be referenced as GBA1 anywhere in config.
+    assert "6N3F" not in {c["pdb_id"] for c in targets.values()}
+    for _name, cfg in targets.items():
+        assert pd_common.validate_pdb_id(cfg["pdb_id"]) == cfg["pdb_id"].upper()
+    print("[check] PDB constructs: LRRK2=7LHT (WT full-length), GBA1=2V3D "
+          "(human acid beta-glucosidase); 6N3F rejected (not GBA1)")

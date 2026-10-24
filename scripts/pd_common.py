@@ -21,10 +21,21 @@ _HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 TARGETS = {
-    # PDB IDs were taken from the original README; confirm construct/mutation
-    # status (e.g. G2019S) on rcsb.org before drawing biological conclusions.
+    # PDB construct notes (verified against RCSB):
+    #   * 7LHT — full-length human LRRK2 dimer, cryo-EM 3.5 A (Cell 2021,
+    #     DOI:10.1016/j.cell.2021.05.004). Wild-type sequence; the G2019S
+    #     specificity comes from ChEMBL assay data (assay_variant_mutation),
+    #     not from the PDB construct itself. Confirm before drawing G2019S
+    #     conclusions from the structure.
+    #   * 2V3D — human acid beta-glucosidase (GBA1), X-ray 1.96 A
+    #     (J Biol Chem 2007, DOI:10.1074/JBC.M705005200), crystallized with
+    #     N-butyl-deoxynojirimycin chaperone. NOTE: the README's 6N3F is
+    #     NOT GBA1 — it is the Tat-SF1/SF3b1 complex. 6N3F was replaced
+    #     with 2V3D.
+    # Prep script strips heterogens (incl. the bound chaperone) and waters,
+    # rebuilds missing atoms, and protonates at physiological pH.
     "LRRK2": {"pdb_id": "7LHT", "ph": 7.4},
-    "GBA1": {"pdb_id": "6N3F", "ph": 5.5},
+    "GBA1": {"pdb_id": "2V3D", "ph": 5.5},
 }
 
 

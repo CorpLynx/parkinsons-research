@@ -4,7 +4,7 @@
 
 This document outlines the complete system requirements, Arch Linux kernel/driver configuration, containerized and isolated CUDA dependencies, target preparation protocols, and automated orchestration scripts to transform a **Mac mini M2**, an **NVIDIA RTX 4070 Ti Super (16GB)**, and an **NVIDIA RTX 2080 Super (8GB)** into an integrated computational biology and drug-screening cluster targeting Parkinson's Disease (PD).
 
-> **Scope & limitations.** This is a *computational triage* workflow. Docking scores and ADMET predictions are noisy in-silico estimates that prioritise compounds for experiments; they are not evidence of efficacy or safety, and nothing here is medical advice. Target PDB IDs (`7LHT`, `6N3F`) and the starter ligand library are unverified defaults: confirm construct, mutation status and compound identity before use. See [SECURITY.md](SECURITY.md) for the trusted-LAN threat model, and `pytest` / `ruff` for local checks.
+> **Scope & limitations.** This is a *computational triage* workflow. Docking scores and ADMET predictions are noisy in-silico estimates that prioritise compounds for experiments; they are not evidence of efficacy or safety, and nothing here is medical advice. Target PDB IDs (`7LHT` LRRK2, `2V3D` GBA1) and the curated ChEMBL ligand library are unverified defaults: confirm construct, mutation status and compound identity before use. See [SECURITY.md](SECURITY.md) for the trusted-LAN threat model, [CITATIONS.md](CITATIONS.md) for tool/data citations, [LICENSE](LICENSE) for licensing, and `pytest` / `ruff` for local checks.
 
 ---
 
@@ -276,7 +276,7 @@ pip install meeko pubchempy chembl_webresource_client
 
 Run [`scripts/prep_targets.py`](scripts/prep_targets.py) on the **Mac mini M2**. It downloads, strips crystallographic artifacts/waters, rebuilds missing side-chain atoms via `PDBFixer`, and protonates two major Parkinson's targets at their physiological $\text{pH}$ values:
 * **LRRK2 Kinase (`7LHT`):** Protonated at cytosolic $\text{pH } 7.4$.
-* **GBA1 Glucocerebrosidase (`6N3F`):** Protonated at acidic lysosomal $\text{pH } 5.5$.
+* **GBA1 Glucocerebrosidase (`2V3D`):** Protonated at acidic lysosomal $\text{pH } 5.5$.
 
 The script lives in [`scripts/prep_targets.py`](scripts/prep_targets.py) in this repository (clone the repo into `/mnt/pd_research/` or symlink `scripts/`).
 
@@ -327,7 +327,7 @@ python3 /mnt/pd_research/scripts/master_pipeline.py \
 # 4. Launch a multi-node screen for GBA1 allosteric lysosomal chaperones
 python3 /mnt/pd_research/scripts/master_pipeline.py \
   --target GBA1 \
-  --pdb 6N3F_clean.pdb
+  --pdb 2V3D_clean.pdb
 ```
 
 ---

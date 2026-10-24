@@ -64,12 +64,22 @@ TARGETS = {
     },
 }
 
-# Reference compounds (chembl_id -> (pref_name, target)) that are expected to
-# be present in the library and to pass the BBB filter. Used by the library
-# build summary and the pipeline check.
-REFERENCES = {
+# Reference compounds expected to be in the library AND pass the BBB filter.
+# Used by the library build summary and the pipeline check.
+REFERENCES_BBB_PASS = {
     "CHEMBL4098877": ("MLi-2", "LRRK2"),  # potent brain-penetrant LRRK2 inhibitor
+    "CHEMBL153479": ("AMBROXOL", "GBA1"),  # GBA1 chaperone, brain-penetrant
+    "CHEMBL603469": ("LESTAURTINIB", "LRRK2"),  # CEP-701, LRRK2/FLT3 inhibitor
 }
+
+# Reference compounds expected to be in the library but NOT pass BBB
+# (too polar / too many HBD). Useful negative controls for the BBB filter.
+REFERENCES_PRESENT_ONLY = {
+    "CHEMBL206468": ("AFEGOSTAT / ISOFAGOMINE", "GBA1"),  # GBA1 chaperone, too polar for BBB
+}
+
+# All reference chembl_ids, flattened for convenience.
+ALL_REFERENCES = {**REFERENCES_BBB_PASS, **REFERENCES_PRESENT_ONLY}
 
 MAX_ACTIVITIES = 2000        # cap on activity records fetched per target (breadth)
 MAX_COMPOUNDS_PER_TARGET = 150  # after potency filtering + dedup
@@ -296,8 +306,8 @@ def curate_target(target_name, cfg):
             "rot_bonds": props["rot_bonds"],
             "heavy_atoms": props["heavy_atoms"],
             "passes_bbb": passes_bbb_rules(props),
-            "is_reference": entry["chembl_id"] in REFERENCES
-            and REFERENCES[entry["chembl_id"]][1] == target_name,
+            "is_reference": entry["chembl_id"] in ALL_REFERENCES
+            and ALL_REFERENCES[entry["chembl_id"]][1] == target_name,
         })
         curated.append(entry)
     return curated
@@ -342,7 +352,7 @@ def fetch_activity_for_molecule(molecule_chembl_id, target_chembl_id):
 
 def reference_entry(chembl_id, target_name, cfg):
     """Build a curated entry for a reference compound fetched directly by ChEMBL ID."""
-    name, ref_target = REFERENCES[chembl_id]
+    name, ref_target = ALL_REFERENCES[chembl_id]
     if ref_target != target_name:
         return None
     mol = fetch_molecule(chembl_id)
@@ -414,7 +424,7 @@ def build_library(output, limit=MAX_COMPOUNDS_PER_TARGET):
     # Ensure every reference compound is present (guaranteed inclusion for the
     # pipeline check), even if it fell outside the potency cap / activity page.
     present_refs = {r.get("chembl_id") for r in all_rows if r.get("chembl_id")}
-    for ref_id, (name, tgt) in REFERENCES.items():
+    for ref_id, (name, tgt) in ALL_REFERENCES.items():
         if ref_id in present_refs:
             continue
         cfg = TARGETS[tgt]
@@ -450,7 +460,7 @@ def build_library(output, limit=MAX_COMPOUNDS_PER_TARGET):
     print(f"Pass BBB/CNS filter:     {n_bbb}")
     print(f"Reference compounds:     {n_ref} (of which pass BBB: {n_ref_bbb})")
     print(f"Written to: {output}")
-    for ref_id, (name, tgt) in REFERENCES.items():
+    for ref_id, (name, tgt) in ALL_REFERENCES.items():
         match = [r for r in all_rows if r.get("chembl_id") == ref_id]
         state = "present + BBB-pass" if match and match[0].get("passes_bbb") else (
             "present" if match else "ABSENT")
