@@ -37,6 +37,7 @@ here are obvious-inactive decoys, not property-matched DUD-E decoys, so a high
 AUC rules out gross scoring failure rather than confirming fine discrimination.
 """
 import argparse
+import os
 import re
 import sys
 
@@ -46,30 +47,69 @@ import pandas as pd
 # standalone (e.g. in CI) outside the pipeline's environment.
 _ID_RE = re.compile(r"[^A-Za-z0-9_.-]")
 
+# Cap pathological inputs the way cns_filter.py does, so a malformed or
+# enormous CSV fails fast instead of exhausting memory.
+MAX_INPUT_ROWS = 2_000_000
+VALID_ROLES = {"positive", "negative"}
+
+
+class InputError(ValueError):
+    """A user-facing problem with an input file or argument (clean exit, no traceback)."""
+
 
 def sanitize_id(value):
     cleaned = _ID_RE.sub("_", str(value)).strip(".")
     return cleaned[:64] or "unnamed"
 
 
+def read_csv(path, what):
+    """Read a CSV with existence/emptiness checks and a row cap; InputError on failure."""
+    if not os.path.isfile(path):
+        raise InputError(f"{what} file not found: {path}")
+    try:
+        df = pd.read_csv(path, nrows=MAX_INPUT_ROWS)
+    except pd.errors.EmptyDataError as exc:
+        raise InputError(f"{what} file is empty: {path}") from exc
+    except (pd.errors.ParserError, UnicodeDecodeError, OSError) as exc:
+        raise InputError(f"{what} file could not be parsed as CSV ({path}): {exc}") from exc
+    if df.empty:
+        raise InputError(f"{what} file has no data rows: {path}")
+    return df
+
+
 def load_controls(controls_csv, target):
-    df = pd.read_csv(controls_csv)
+    df = read_csv(controls_csv, "controls")
     required = {"ligand_id", "smiles", "target", "control_role"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"{controls_csv} missing column(s): {sorted(missing)}")
-    df = df[df["target"].str.upper() == target.upper()].copy()
+        raise InputError(f"{controls_csv} missing column(s): {sorted(missing)}")
+    df = df.dropna(subset=["ligand_id", "smiles", "target", "control_role"]).copy()
+    df["control_role"] = df["control_role"].astype(str).str.strip().str.lower()
+    bad_roles = set(df["control_role"]) - VALID_ROLES
+    if bad_roles:
+        raise InputError(
+            f"{controls_csv} has unknown control_role value(s) {sorted(bad_roles)}; "
+            f"expected only {sorted(VALID_ROLES)}")
+    df = df[df["target"].astype(str).str.upper() == target.upper()].copy()
     if df.empty:
-        raise ValueError(f"No controls for target {target!r} in {controls_csv}")
+        raise InputError(f"No controls for target {target!r} in {controls_csv}")
     df["ligand_id"] = df["ligand_id"].map(sanitize_id)
+    dupes = df["ligand_id"][df["ligand_id"].duplicated()].unique()
+    if len(dupes):
+        raise InputError(
+            f"{controls_csv} has duplicate ligand_id(s) for {target}: {sorted(dupes)}")
     return df
 
 
 def spike(args):
+    if os.path.abspath(args.out) == os.path.abspath(args.filtered):
+        raise InputError("--out must differ from --filtered (refusing to overwrite the input)")
     controls = load_controls(args.controls, args.target)
-    filtered = pd.read_csv(args.filtered)
-    if "ligand_id" not in filtered.columns or "smiles" not in filtered.columns:
-        raise ValueError(f"{args.filtered} needs 'ligand_id' and 'smiles' columns")
+    filtered = read_csv(args.filtered, "filtered-ligand")
+    missing = {"ligand_id", "smiles"} - set(filtered.columns)
+    if missing:
+        raise InputError(f"{args.filtered} needs column(s): {sorted(missing)}")
+    filtered = filtered.dropna(subset=["ligand_id", "smiles"]).copy()
     filtered["ligand_id"] = filtered["ligand_id"].map(sanitize_id)
 
     ctrl_slim = controls[["ligand_id", "smiles"]]
@@ -113,14 +153,24 @@ def roc_auc(pos_scores, neg_scores):
 
 def evaluate(args):
     controls = load_controls(args.controls, args.target)
-    scores = pd.read_csv(args.scores)
+    scores = read_csv(args.scores, "scores")
     if "ligand_id" not in scores.columns:
-        raise ValueError(f"{args.scores} needs a 'ligand_id' column")
+        raise InputError(f"{args.scores} needs a 'ligand_id' column")
     if args.score_col not in scores.columns:
-        raise ValueError(f"{args.scores} has no column {args.score_col!r}; "
+        raise InputError(f"{args.scores} has no column {args.score_col!r}; "
                          f"available: {list(scores.columns)}")
     scores = scores.copy()
     scores["ligand_id"] = scores["ligand_id"].map(sanitize_id)
+    # Coerce the score column to numbers; a non-numeric score would otherwise
+    # make groupby().max() compare strings and silently corrupt the ranking.
+    raw = scores[args.score_col]
+    scores[args.score_col] = pd.to_numeric(raw, errors="coerce")
+    n_bad = int(scores[args.score_col].isna().sum() - raw.isna().sum())
+    if n_bad:
+        print(f"[warn] {n_bad} row(s) had a non-numeric {args.score_col!r} and were ignored.")
+    scores = scores.dropna(subset=[args.score_col])
+    if scores.empty:
+        raise InputError(f"No numeric {args.score_col!r} values in {args.scores}")
     # Best (max) score per ligand, in case several poses are present.
     best = scores.groupby("ligand_id")[args.score_col].max()
 
@@ -206,7 +256,11 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

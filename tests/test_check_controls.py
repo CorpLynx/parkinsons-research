@@ -137,3 +137,65 @@ def test_missing_score_column_raises(tmp_path):
         cc.evaluate(_args(target="LRRK2", scores=str(scores),
                           controls=DATA_CONTROLS, score_col="CNNscore",
                           min_auc=None, require_all=False))
+
+
+# ---- hardening -----------------------------------------------------------
+
+def test_missing_file_is_clean_input_error():
+    with pytest.raises(cc.InputError):
+        cc.load_controls("/no/such/controls.csv", "LRRK2")
+
+
+def test_empty_file_is_input_error(tmp_path):
+    empty = tmp_path / "empty.csv"
+    empty.write_text("")
+    with pytest.raises(cc.InputError):
+        cc.read_csv(str(empty), "scores")
+
+
+def test_unknown_control_role_rejected(tmp_path):
+    bad = tmp_path / "ctrl.csv"
+    bad.write_text("ligand_id,smiles,target,control_role\n"
+                   "A,CCO,LRRK2,positive\nB,CCO,LRRK2,maybe\n")
+    with pytest.raises(cc.InputError):
+        cc.load_controls(str(bad), "LRRK2")
+
+
+def test_duplicate_control_ids_rejected(tmp_path):
+    bad = tmp_path / "ctrl.csv"
+    bad.write_text("ligand_id,smiles,target,control_role\n"
+                   "DUP,CCO,LRRK2,positive\nDUP,CCO,LRRK2,negative\n")
+    with pytest.raises(cc.InputError):
+        cc.load_controls(str(bad), "LRRK2")
+
+
+def test_spike_refuses_to_overwrite_input(tmp_path):
+    f = tmp_path / "same.csv"
+    f.write_text("ligand_id,smiles\nX,CCO\n")
+    with pytest.raises(cc.InputError):
+        cc.spike(_args(target="LRRK2", filtered=str(f),
+                       controls=DATA_CONTROLS, out=str(f)))
+
+
+def test_evaluate_ignores_non_numeric_scores(tmp_path, capsys):
+    ctrls = cc.load_controls(DATA_CONTROLS, "LRRK2")
+    scores = tmp_path / "s.csv"
+    with open(scores, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["ligand_id", "CNNscore"])
+        for _, r in ctrls.iterrows():
+            val = 0.9 if r["control_role"] == "positive" else 0.1
+            w.writerow([r["ligand_id"], val])
+        w.writerow(["JUNK_ROW", "not_a_number"])  # must be ignored, not crash
+    code = cc.evaluate(_args(target="LRRK2", scores=str(scores),
+                             controls=DATA_CONTROLS, score_col="CNNscore",
+                             min_auc=0.7, require_all=False))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "non-numeric" in out
+
+
+def test_main_returns_1_on_input_error():
+    code = cc.main(["evaluate", "--target", "LRRK2",
+                    "--scores", "/no/such/file.csv"])
+    assert code == 1
