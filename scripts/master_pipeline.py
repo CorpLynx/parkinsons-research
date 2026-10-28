@@ -238,18 +238,26 @@ def collect_poses(docked_sdf, source):
     return poses
 
 
-def extract_top_hits(poses, filtered_csv, top_hits_csv, min_cnn_score=MIN_CNN_SCORE):
-    """Keeps the single best pose per ligand above threshold; SMILES come from the filtered CSV."""
+def extract_top_hits(poses, filtered_csv, top_hits_csv, min_cnn_score=MIN_CNN_SCORE,
+                     all_scores_csv=None):
+    """Keeps the single best pose per ligand above threshold; SMILES come from the filtered CSV.
+
+    When all_scores_csv is given, also writes the best pose per ligand WITHOUT
+    the threshold filter. That unfiltered table is what check_controls.py needs
+    to evaluate negative controls, which by design score below the hit cutoff.
+    """
     columns = ["ligand_id", "smiles", "CNNscore", "CNNaffinity", "pose_source"]
     df = pd.DataFrame(poses, columns=["ligand_id", "CNNscore", "CNNaffinity", "pose_source"])
-    df = df[df["CNNscore"] >= min_cnn_score]
     df = df.sort_values("CNNscore", ascending=False).drop_duplicates("ligand_id", keep="first")
     smiles = pd.read_csv(filtered_csv)[["ligand_id", "smiles"]]
     smiles["ligand_id"] = smiles["ligand_id"].map(sanitize_id)
     df = df.merge(smiles, on="ligand_id", how="left")[columns]
-    df.to_csv(top_hits_csv, index=False)
-    print(f"[Hit Triage] Extracted {len(df)} high-confidence binders (CNNscore >= {min_cnn_score}).")
-    return len(df)
+    if all_scores_csv is not None:
+        df.to_csv(all_scores_csv, index=False)
+    hits = df[df["CNNscore"] >= min_cnn_score]
+    hits.to_csv(top_hits_csv, index=False)
+    print(f"[Hit Triage] Extracted {len(hits)} high-confidence binders (CNNscore >= {min_cnn_score}).")
+    return len(hits)
 
 
 def gnina_docker_cmd(gpu_id, args, run_id, target):
@@ -462,6 +470,7 @@ def main():
     print("\n=== STAGE 4: Hit Triage & Neuro-ADMET Validation (Arch 2080 Super) ===")
     admet_dir = stage_dir(run_id, args.target, "06_admet")
     top_hits_csv = os.path.join(admet_dir, f"{args.target}_top_hits.csv")
+    all_scores_csv = os.path.join(admet_dir, f"{args.target}_all_scores.csv")
     admet_out_csv = os.path.join(admet_dir, f"{args.target}_validated_candidates.csv")
     final_summary = os.path.join(admet_dir, f"{args.target}_FINAL_SAFE_LEADS.csv")
 
@@ -482,9 +491,10 @@ def main():
         return
     else:
         poses = collect_poses(gnina_out_sdf, "gnina_dock") + collect_poses(rescored_sdf, "diffdock_rescored")
-        num_hits = extract_top_hits(poses, cns_csv, top_hits_csv)
+        num_hits = extract_top_hits(poses, cns_csv, top_hits_csv, all_scores_csv=all_scores_csv)
         mark_stage_done(manifest, "hit_triage", {
             "top_hits_csv": top_hits_csv,
+            "all_scores_csv": all_scores_csv,
             "n_hits": num_hits,
         })
 

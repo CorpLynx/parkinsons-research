@@ -377,7 +377,7 @@ $PD_SHARED_ROOT/runs/{RUN_ID}/{target}/
 ├── 03_pockets/      P2Rank pocket predictions
 ├── 04_diffdock/     DiffDock poses
 ├── 05_gnina/        GNINA docked + rescored SDFs, DiffDock input CSV
-├── 06_admet/        Top hits, ADMET output, FINAL_SAFE_LEADS.csv
+├── 06_admet/        Top hits, all_scores.csv, ADMET output, FINAL_SAFE_LEADS.csv
 └── manifest.json    Run metadata, stage completion, lead counts
 ```
 
@@ -387,6 +387,46 @@ Summarise any run with:
 python3 scripts/check_pipeline.py \
   $PD_SHARED_ROOT/runs/{RUN_ID}/{target}/06_admet/{target}_FINAL_SAFE_LEADS.csv
 ```
+
+### 7.5 Validating the screen with known binders and decoys (controls)
+
+Docking and CNN scores are noisy. Before trusting a ranking, confirm the screen
+puts molecules that are *known* to bind the target above molecules that are
+known *not* to. `data/controls.csv` ships a labelled set per target: positive
+controls (e.g. **MLi-2** and staurosporine for LRRK2; isofagomine, ambroxol and
+the native 2V3D chaperone miglustat for GBA1) and negative "decoy" controls
+(caffeine, glucose, aspirin, …) that should score low.
+
+1. **Spike** the controls into the CNS-filtered ligand set so they are docked
+   alongside the library (controls bypass the BBB filter on purpose, so that
+   negatives such as glucose are not dropped before docking):
+
+   ```bash
+   python3 scripts/check_controls.py spike --target LRRK2 \
+     --filtered $PD_SHARED_ROOT/runs/{RUN_ID}/LRRK2/02_cns/LRRK2_cns.csv \
+     --out      $PD_SHARED_ROOT/runs/{RUN_ID}/LRRK2/02_cns/LRRK2_cns_spiked.csv
+   ```
+
+2. Run the pipeline as usual. Stage 4 now also writes an unfiltered
+   `{target}_all_scores.csv` (best pose per ligand, before the hit threshold),
+   which is what the evaluator needs — negatives are expected to fall *below*
+   the hit cutoff.
+
+3. **Evaluate** how well positives separated from negatives:
+
+   ```bash
+   python3 scripts/check_controls.py evaluate --target LRRK2 \
+     --scores $PD_SHARED_ROOT/runs/{RUN_ID}/LRRK2/06_admet/LRRK2_all_scores.csv \
+     --score-col CNNscore --min-auc 0.7
+   ```
+
+   It prints each control's score, the median of each group, and the ROC-AUC
+   (probability a random positive outranks a random negative; `1.0` perfect,
+   `0.5` coin-flip), and exits non-zero if the AUC is below `--min-auc`. This is
+   a **sanity** check: the negatives are obvious-inactive decoys, not
+   property-matched DUD-E decoys, so a high AUC rules out gross scoring failure
+   rather than proving fine-grained discrimination. If known binders do **not**
+   rise to the top, treat that run's ranking as unreliable.
 
 ---
 
